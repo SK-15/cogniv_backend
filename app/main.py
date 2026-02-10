@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
 import asyncio
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +7,7 @@ from modules.auth import sign_up_user, login_user, get_user
 from modules.chat import get_user_threads, get_thread_chats, create_thread, save_chat_message, delete_thread
 from modules.llm import stream_openai, stream_gemini
 from modules.websearch import web_search_task
+from modules.storage import upload_to_supabase
 
 app = FastAPI(title="Supabase LLM Chatbot API")
 
@@ -91,13 +92,16 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
     except Exception:
         raise HTTPException(status_code=401, detail="Authentication failed")
 
+    # Fetch chat history
+    history = await get_thread_chats(user_id, request.thread_id)
+
     async def generate_and_save():
         full_response = ""
         
         if request.provider == "gemini":
-            generator_func = stream_gemini(request.prompt)
+            generator_func = stream_gemini(request.prompt, history=history)
         else:
-            generator_func = stream_openai(request.prompt)
+            generator_func = stream_openai(request.prompt, history=history)
             
         try:
             async for chunk in generator_func:
@@ -112,6 +116,57 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
                 asyncio.create_task(save_chat_message(user_id, request.thread_id, request.prompt, full_response))
 
     return StreamingResponse(generate_and_save(), media_type="text/event-stream")
+
+@app.post("/upload")
+async def upload_file(
+    thread_id: str,
+    file: UploadFile = File(...),
+    authorization: str = Header(None)
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    
+    token = authorization.split(" ")[1]
+    try:
+        user_res = await get_user(token)
+        if not user_res.user:
+            raise HTTPException(status_code=401, detail="Invalid session")
+        user_id = user_res.user.id
+        
+        # Upload to Supabase Storage
+        public_url = await upload_to_supabase(file)
+        if not public_url:
+            raise HTTPException(status_code=500, detail="Failed to upload file")
+            
+        # Parse file content (assuming text/markdown/code for now)
+        # We need to reset the file cursor because upload_to_supabase read it
+        await file.seek(0)
+        content = await file.read()
+        
+        try:
+            text_content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            # If binary, just use the URL
+            text_content = f"I have uploaded a file: {file.filename}. Access it here: {public_url}"
+        else:
+            # If text, include a snippet or full content
+            text_content = f"I have uploaded a file '{file.filename}'.\n\nContent:\n{text_content}"
+
+        # Save as a user message in the chat history
+        # We save it as a "query" with a system/placeholder response or empty response
+        # Actually, best to save it as a query, and have the AI acknowledge it?
+        # For now, we'll just insert it into chat_history.
+        # But wait, `save_chat_message` expects a response.
+        # We can simulate an AI acknowledgement.
+        
+        ai_acknowledgement = f"Received file: {file.filename}."
+        
+        await save_chat_message(user_id, thread_id, text_content, ai_acknowledgement)
+        
+        return {"message": "File uploaded and processed", "url": public_url}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/threads")
 async def get_threads(authorization: str = Header(None)):
