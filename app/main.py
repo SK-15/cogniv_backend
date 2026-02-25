@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, WebSocket, WebSocketDisconnect
+from typing import Optional
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
 from modules.config import settings
@@ -14,6 +15,7 @@ from modules.chat import get_user_threads, get_thread_chats, create_thread, save
 from modules.llm import stream_openai, stream_gemini
 from modules.websearch import web_search_task
 from modules.storage import upload_to_supabase
+from modules.ocr import extract_structured_text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +47,10 @@ class NewChatRequest(BaseModel):
 
 class WebSearchRequest(BaseModel):
     query: str
+
+class OCRRequest(BaseModel):
+    provider: str = "gemini"
+    prompt: Optional[str] = None
 
 @app.post("/signup")
 async def signup(request: AuthRequest):
@@ -182,8 +188,14 @@ async def upload_file(
         ai_acknowledgement = f"Received file: {file.filename}."
 
         logger.info(f"[/upload] Saving chat message for user_id={user_id}, thread_id={thread_id}...")
-        await save_chat_message(user_id, thread_id, text_content, ai_acknowledgement)
-        logger.info("[/upload] Chat message saved successfully")
+        try:
+            save_success = await save_chat_message(user_id, thread_id, text_content, ai_acknowledgement)
+            if save_success:
+                logger.info("[/upload] Chat message saved successfully")
+            else:
+                logger.error("[/upload] save_chat_message returned False — check database logs or thread_id validity")
+        except Exception as db_err:
+            logger.error(f"[/upload] Failed to save chat message to database: {db_err}", exc_info=True)
 
         logger.info(f"[/upload] Upload complete. Returning URL: {public_url}")
         return {"message": "File uploaded and processed", "url": public_url}
@@ -267,6 +279,48 @@ async def websearch(request: WebSearchRequest, authorization: str = Header(None)
         answer = await web_search_task(request.query)
         return {"answer": answer}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ocr")
+async def ocr_endpoint(
+    file: UploadFile = File(...),
+    provider: str = "gemini",
+    prompt: Optional[str] = None,
+    authorization: str = Header(None)
+):
+    """
+    Perform OCR on an uploaded image and return structured text as JSON.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    
+    token = authorization.split(" ")[1]
+    try:
+        user_res = await get_user(token)
+        if not user_res.user:
+            raise HTTPException(status_code=401, detail="Invalid session")
+            
+        # Read image bytes
+        image_bytes = await file.read()
+        mime_type = file.content_type or "image/jpeg"
+        
+        # Extract structured text
+        structured_data = await extract_structured_text(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            provider=provider,
+            prompt=prompt
+        )
+        
+        if structured_data is None:
+            raise HTTPException(status_code=500, detail="OCR extraction failed")
+            
+        return structured_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OCR endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/listen")

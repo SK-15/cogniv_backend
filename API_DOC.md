@@ -232,7 +232,26 @@ Upload a file to a specific thread.
     *   **Code**: 401 Unauthorized
     *   **Code**: 500 Internal Server Error
 
-### 10. Live Audio Transcription (WebSocket)
+### 10. OCR (Structured Text Extraction)
+Perform OCR on an image and extract structured text as JSON.
+
+*   **URL**: `/ocr`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+    *   `Content-Type: multipart/form-data`
+*   **Request Body**:
+    *   `file`: The image file to process (in `multipart/form-data` form).
+    *   `provider`: Optional. Can be `"gemini"` (default) or `"openai"`.
+    *   `prompt`: Optional. A custom prompt to guide the extraction.
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**: A JSON object containing the structured data.
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 500 Internal Server Error
+
+### 11. Live Audio Transcription (WebSocket)
 Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
 
 *   **URL**: `/listen`

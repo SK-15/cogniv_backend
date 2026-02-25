@@ -26,12 +26,19 @@ async def upload_to_supabase(file: UploadFile, bucket: str = "user") -> str:
 
         # Upload to Supabase
         logger.info(f"[upload_to_supabase] Uploading to Supabase bucket '{bucket}' at path '{filename}'...")
-        response = supabase.storage.from_(bucket).upload(
-            path=filename,
-            file=content,
-            file_options={"content-type": file.content_type}
-        )
-        logger.info(f"[upload_to_supabase] Supabase upload response: {response}")
+        try:
+            response = supabase.storage.from_(bucket).upload(
+                path=filename,
+                file=content,
+                file_options={"content-type": file.content_type}
+            )
+            logger.info(f"[upload_to_supabase] Supabase upload successful. Path: {response}")
+        except Exception as upload_err:
+            logger.error(f"[upload_to_supabase] Supabase storage upload failed: {upload_err}")
+            # Try to get more info if it's a supabase-specific error
+            if hasattr(upload_err, 'message'):
+                logger.error(f"[upload_to_supabase] Error message: {upload_err.message}")
+            return None
 
         # Get public URL
         public_url = supabase.storage.from_(bucket).get_public_url(filename)
