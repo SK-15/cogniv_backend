@@ -15,7 +15,8 @@ from modules.chat import get_user_threads, get_thread_chats, create_thread, save
 from modules.llm import stream_openai, stream_gemini
 from modules.websearch import web_search_task
 from modules.storage import upload_to_supabase
-from modules.ocr import extract_structured_text
+from modules.ocr import extract_structured_text, extract_text
+from modules.llm import generate_response
 
 logging.basicConfig(
     level=logging.INFO,
@@ -321,6 +322,63 @@ async def ocr_endpoint(
         raise
     except Exception as e:
         logger.error(f"OCR endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/analyse_screen")
+async def analyse_screen(
+    file: UploadFile = File(...),
+    provider: str = "gemini",
+    # authorization: str = Header(None)
+):
+    """
+    Extract text from an image and use an LLM to answer any questions found within.
+    """
+    # if not authorization or not authorization.startswith("Bearer "):
+    #     raise HTTPException(status_code=401, detail="Missing or invalid token")
+    
+    # token = authorization.split(" ")[1]
+    try:
+        # user_res = await get_user(token)
+        # if not user_res.user:
+            # raise HTTPException(status_code=401, detail="Invalid session")
+            
+        # 1. Read image bytes
+        image_bytes = await file.read()
+        mime_type = file.content_type or "image/jpeg"
+        
+        # 2. Extract plain text from image
+        logger.info(f"[/analyse_screen] Extracting text using {provider}")
+        extracted_text = await extract_text(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            provider=provider
+        )
+        
+        if not extracted_text:
+            raise HTTPException(status_code=500, detail="Failed to extract text from the image")
+            
+        # 3. Use LLM to answer questions
+        logger.info("[/analyse_screen] Text extracted, querying LLM for answers")
+        prompt = (
+            "Here is the text extracted from an image:\n\n"
+            f"```text\n{extracted_text}\n```\n\n"
+            "Please carefully review this text, identify any questions or problems present in it, and provide step-by-step answers or solutions to those questions."
+        )
+        
+        llm_response = await generate_response(prompt, model_type=provider)
+        
+        if not llm_response:
+            raise HTTPException(status_code=500, detail="LLM failed to generate a response")
+            
+        return {
+            "extracted_text": extracted_text,
+            "answers": llm_response
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Analyse Screen endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/listen")

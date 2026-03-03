@@ -41,6 +41,80 @@ async def extract_structured_text(
         logger.error(f"OCR extraction error with {provider}: {e}", exc_info=True)
         return None
 
+async def extract_text(
+    image_bytes: bytes,
+    mime_type: str,
+    provider: str = "gemini",
+    prompt: Optional[str] = None
+) -> Optional[str]:
+    """
+    Extract raw text from an image using the specified LLM provider.
+    Returns a string containing the text or None if extraction fails.
+    """
+    default_prompt = "Extract all visible text from this image exactly as it appears. Do not add any conversational text or markdown formatting outside of the extracted text itself."
+    
+    active_prompt = prompt if prompt else default_prompt
+
+    try:
+        if provider.lower() == "gemini":
+            return await _extract_gemini_text(image_bytes, mime_type, active_prompt)
+        elif provider.lower() == "openai":
+            return await _extract_openai_text(image_bytes, mime_type, active_prompt)
+        else:
+            logger.error(f"Unsupported OCR provider: {provider}")
+            return None
+    except Exception as e:
+        logger.error(f"Text extraction error with {provider}: {e}", exc_info=True)
+        return None
+
+async def _extract_gemini_text(image_bytes: bytes, mime_type: str, prompt: str) -> Optional[str]:
+    """Internal helper for Gemini plain text OCR."""
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    
+    content = [
+        prompt,
+        {
+            "mime_type": mime_type,
+            "data": image_bytes
+        }
+    ]
+    
+    # We do NOT use response_mime_type="application/json" here
+    response = await model.generate_content_async(content)
+    
+    if not response or not response.text:
+        return None
+        
+    return response.text
+
+async def _extract_openai_text(image_bytes: bytes, mime_type: str, prompt: str) -> Optional[str]:
+    """Internal helper for OpenAI plain text OCR."""
+    client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime_type};base64,{base64_image}"
+                    }
+                }
+            ]
+        }
+    ]
+    
+    # We do NOT use response_format={"type": "json_object"} here
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages
+    )
+    
+    return response.choices[0].message.content
+
 async def _extract_gemini(image_bytes: bytes, mime_type: str, prompt: str) -> Optional[dict]:
     """Internal helper for Gemini OCR."""
     # Using gemini-1.5-flash for speed and strong multimodal performance
