@@ -275,7 +275,30 @@ Extract raw text from an uploaded image and then use an LLM to answer any questi
     *   **Code**: 401 Unauthorized
     *   **Code**: 500 Internal Server Error
 
-### 12. Live Audio Transcription (WebSocket)
+### 12. AI Answer
+Answer a question provided in the request body using OpenAI.
+
+*   **URL**: `/ai-answer`
+*   **Method**: `POST`
+*   **Request Body**:
+    ```json
+    {
+      "question": "What is the capital of France?"
+    }
+    ```
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "answer": "The capital of France is Paris."
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 500 Internal Server Error
+
+### 13. Live Audio Transcription (WebSocket)
 Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
 
 *   **URL**: `/listen`

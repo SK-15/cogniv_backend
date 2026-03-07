@@ -53,6 +53,9 @@ class OCRRequest(BaseModel):
     provider: str = "gemini"
     prompt: Optional[str] = None
 
+class AIAnswerRequest(BaseModel):
+    question: str
+
 @app.post("/signup")
 async def signup(request: AuthRequest):
     try:
@@ -379,6 +382,17 @@ async def analyse_screen(
         raise
     except Exception as e:
         logger.error(f"Analyse Screen endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ai-answer")
+async def ai_answer(request: AIAnswerRequest):
+    try:
+        answer = await generate_response(request.question, model_type="openai")
+        if answer is None:
+            raise HTTPException(status_code=500, detail="Failed to generate AI response")
+        return {"answer": answer}
+    except Exception as e:
+        logger.error(f"AI Answer endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.websocket("/listen")
