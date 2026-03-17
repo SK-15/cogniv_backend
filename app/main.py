@@ -54,7 +54,16 @@ class OCRRequest(BaseModel):
     prompt: Optional[str] = None
 
 class AIAnswerRequest(BaseModel):
-    question: str
+    question: Optional[str] = None
+    query: Optional[str] = None
+    text: Optional[str] = None
+
+    def get_question(self) -> str:
+        q = self.question or self.query or self.text
+        if not q:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=422, detail="Provide 'question', 'query', or 'text' in the request body.")
+        return q
 
 @app.post("/signup")
 async def signup(request: AuthRequest):
@@ -330,7 +339,7 @@ async def ocr_endpoint(
 @app.post("/analyse_screen")
 async def analyse_screen(
     file: UploadFile = File(...),
-    provider: str = "gemini",
+    provider: str = "openai",
     # authorization: str = Header(None)
 ):
     """
@@ -387,7 +396,7 @@ async def analyse_screen(
 @app.post("/ai-answer")
 async def ai_answer(request: AIAnswerRequest):
     try:
-        answer = await generate_response(request.question, model_type="openai")
+        answer = await generate_response(request.get_question(), model_type="openai")
         if answer is None:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
         return {"answer": answer}

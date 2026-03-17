@@ -261,7 +261,7 @@ Extract raw text from an uploaded image and then use an LLM to answer any questi
     *   `Content-Type: multipart/form-data`
 *   **Request Body**:
     *   `file`: The image file to analyze (in `multipart/form-data` form).
-    *   `provider`: Optional. The LLM provider to use for both OCR and answering. Can be `"gemini"` (default) or `"openai"`.
+    *   `provider`: Optional. The LLM provider to use for both OCR and answering. Can be `"openai"` (default) or `"gemini"`.
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content**:
@@ -396,7 +396,7 @@ curl -X POST "http://localhost:8000/ocr" \
 curl -X POST "http://localhost:8000/analyse_screen" \
      -H "Authorization: Bearer <TOKEN>" \
      -F "file=@/path/to/your/screenshot.png" \
-     -F "provider=gemini"
+     -F "provider=openai"
 ```
 
 ---
