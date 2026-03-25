@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, WebSocket, WebSocketDisconnect, Request
+from uuid import UUID
+
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from typing import Optional
 from deepgram import DeepgramClient
@@ -19,6 +21,12 @@ from modules.websearch import web_search_task
 from modules.storage import upload_to_supabase
 from modules.ocr import extract_structured_text, extract_text
 from modules.llm import generate_response
+from modules.resume_text import extract_resume_text, ResumeTextExtractionError
+from modules.interview import (
+    save_interview_profile,
+    create_interview_session,
+    insert_interview_response,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +48,28 @@ UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
+ALLOWED_RESUME_SUFFIXES = {".pdf", ".docx"}
+
+
+async def require_user_id(authorization: str = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    token = authorization.split(" ", 1)[1]
+    user_res = await get_user(token)
+    if not user_res.user:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    return user_res.user.id
+
+
+def _parse_form_bool(value: str) -> bool:
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _resume_filename_allowed(filename: str | None) -> bool:
+    if not filename:
+        return False
+    return Path(filename).suffix.lower() in ALLOWED_RESUME_SUFFIXES
+
 class AuthRequest(BaseModel):
     email: str
     password: str
@@ -59,7 +89,14 @@ class OCRRequest(BaseModel):
     provider: str = "gemini"
     prompt: Optional[str] = None
 
+class InterviewSessionRequest(BaseModel):
+    profile_id: str
+    job_title: str
+    job_description: str
+
+
 class AIAnswerRequest(BaseModel):
+    session_id: str
     question: Optional[str] = None
     query: Optional[str] = None
     text: Optional[str] = None
@@ -343,24 +380,81 @@ async def ocr_endpoint(
         logger.error(f"OCR endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/analyse_screen")
+
+@app.post("/save_profile")
+async def save_profile(
+    job_role: str = Form(...),
+    name: str = Form(...),
+    is_default: str = Form("false"),
+    resume: UploadFile = File(...),
+    user_id: str = Depends(require_user_id),
+):
+    if not _resume_filename_allowed(resume.filename):
+        raise HTTPException(
+            status_code=422,
+            detail="Resume must be a PDF or DOCX file (.pdf, .docx)",
+        )
+
+    resume_bytes = await resume.read()
+    if not resume_bytes:
+        raise HTTPException(status_code=422, detail="Resume file is empty.")
+
+    try:
+        resume_text = await asyncio.to_thread(
+            extract_resume_text, filename=resume.filename, data=resume_bytes
+        )
+    except ResumeTextExtractionError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    row = await save_interview_profile(
+        user_id=user_id,
+        job_role=job_role,
+        name=name,
+        resume_text=resume_text,
+        is_default=_parse_form_bool(is_default),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to save profile")
+    return row
+
+
+@app.post("/interview/session")
+async def start_interview_session(
+    body: InterviewSessionRequest,
+    user_id: str = Depends(require_user_id),
+):
+    try:
+        profile_uuid = UUID(body.profile_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid profile_id")
+
+    session_id = await create_interview_session(
+        user_id,
+        profile_uuid,
+        body.job_title,
+        body.job_description,
+    )
+    if not session_id:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"session_id": str(session_id)}
+
+
+@app.post("/analyse-screen")
 async def analyse_screen(
     file: UploadFile = File(...),
-    provider: str = "openai",
-    # authorization: str = Header(None)
+    session_id: str = Form(...),
+    provider: str = Query("openai"),
+    user_id: str = Depends(require_user_id),
 ):
     """
     Extract text from an image and use an LLM to answer any questions found within.
     """
-    # if not authorization or not authorization.startswith("Bearer "):
-    #     raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    # token = authorization.split(" ")[1]
     try:
-        # user_res = await get_user(token)
-        # if not user_res.user:
-            # raise HTTPException(status_code=401, detail="Invalid session")
-            
+        session_uuid = UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid session_id")
+
+    try:
         # 1. Read image bytes
         image_bytes = await file.read()
         mime_type = file.content_type or "image/jpeg"
@@ -388,25 +482,58 @@ async def analyse_screen(
         
         if not llm_response:
             raise HTTPException(status_code=500, detail="LLM failed to generate a response")
-            
+
+        saved = await insert_interview_response(
+            user_id,
+            session_uuid,
+            extracted_text,
+            llm_response,
+            "screen",
+        )
+        if not saved:
+            raise HTTPException(status_code=404, detail="Session not found")
+
         return {
             "extracted_text": extracted_text,
-            "answers": llm_response
+            "answers": llm_response,
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Analyse Screen endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/ai-answer")
-async def ai_answer(request: AIAnswerRequest):
+async def ai_answer(
+    request: AIAnswerRequest,
+    user_id: str = Depends(require_user_id),
+):
     try:
-        answer = await generate_response(request.get_question(), model_type="openai")
+        try:
+            session_uuid = UUID(request.session_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid session_id")
+
+        question = request.get_question()
+        answer = await generate_response(question, model_type="openai")
         if answer is None:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
+
+        saved = await insert_interview_response(
+            user_id,
+            session_uuid,
+            question,
+            answer,
+            "transcript",
+        )
+        if not saved:
+            raise HTTPException(status_code=404, detail="Session not found")
+
         return {"answer": answer}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"AI Answer endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

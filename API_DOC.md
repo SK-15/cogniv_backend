@@ -251,17 +251,69 @@ Perform OCR on an image and extract structured text as JSON.
     *   **Code**: 401 Unauthorized
     *   **Code**: 500 Internal Server Error
 
-### 11. Analyse Screen (Text Extraction & Q&A)
-Extract raw text from an uploaded image and then use an LLM to answer any questions identified within that text.
+### 11. Save Interview Profile
+Save an interview profile (job role, display name, resume file, default flag) for the authenticated user. The server reads the uploaded file **in-memory**, extracts plain text from the resume (PDF via PyMuPDF, DOCX via python-docx), and writes the extracted text into `interview_profiles.resume_text`. (The API form field `job_role` is stored in DB column `role`.)
 
-*   **URL**: `/analyse_screen`
+*   **URL**: `/save_profile`
 *   **Method**: `POST`
 *   **Headers**:
     *   `Authorization: Bearer <access_token>`
     *   `Content-Type: multipart/form-data`
+*   **Request Body** (form fields):
+    *   `job_role`: **Required**. Text.
+    *   `name`: **Required**. Profile label.
+    *   `is_default`: Optional. String interpreted as boolean (`true`, `1`, `yes`, `on`). Default `false`. If true, other profiles for this user are cleared from default before insert.
+    *   `resume`: **Required**. File — `.pdf` or `.docx`.
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**: Row from `interview_profiles` (`id`, `user_id`, `name`, `role`, `resume_text`, `is_default`, `sort_order`, `created_at`, `updated_at`).
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 422 Unprocessable Entity (invalid resume type)
+    *   **Code**: 500 Internal Server Error
+
+### 12. Start Interview Session
+Create a session for a given profile and job context. The profile must belong to the authenticated user.
+
+*   **URL**: `/interview/session`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+    *   `Content-Type: application/json`
 *   **Request Body**:
-    *   `file`: The image file to analyze (in `multipart/form-data` form).
-    *   `provider`: Optional. The LLM provider to use for both OCR and answering. Can be `"openai"` (default) or `"gemini"`.
+    ```json
+    {
+      "profile_id": "uuid-of-interview-profile",
+      "job_title": "Senior Backend Engineer",
+      "job_description": "Full job description text..."
+    }
+    ```
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "session_id": "uuid-of-new-session"
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 404 Not Found (profile missing or not owned by user)
+    *   **Code**: 422 Unprocessable Entity (invalid `profile_id`)
+
+### 13. Analyse Screen (Text Extraction & Q&A)
+Extract raw text from an uploaded image and then use an LLM to answer any questions identified within that text. Persists `query` (extracted text), `response` (LLM answer), and `query_type` = `screen` on `interview_responses` for the given session.
+
+*   **URL**: `/analyse-screen`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+    *   `Content-Type: multipart/form-data`
+*   **Query Parameters**:
+    *   `provider`: Optional. LLM for OCR and answering. `"openai"` (default) or `"gemini"`.
+*   **Request Body** (form fields):
+    *   `file`: The image file to analyze.
+    *   `session_id`: **Required**. UUID of an `interview_sessions` row owned by the user.
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content**:
@@ -273,19 +325,27 @@ Extract raw text from an uploaded image and then use an LLM to answer any questi
         ```
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
+    *   **Code**: 404 Not Found (session not found or not owned)
+    *   **Code**: 422 Unprocessable Entity (invalid `session_id`)
     *   **Code**: 500 Internal Server Error
 
-### 12. AI Answer
-Answer a question provided in the request body using OpenAI.
+### 14. AI Answer
+Answer a question using OpenAI. Persists `query` (question), `response` (answer), and `query_type` = `transcript` on `interview_responses` for the given session.
 
 *   **URL**: `/ai-answer`
 *   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+    *   `Content-Type: application/json`
 *   **Request Body**:
     ```json
     {
+      "session_id": "uuid-of-interview-session",
       "question": "What is the capital of France?"
     }
     ```
+    *   `session_id`: **Required**.
+    *   Provide exactly one of `question`, `query`, or `text` for the prompt (same as before).
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content**:
@@ -296,9 +356,11 @@ Answer a question provided in the request body using OpenAI.
         ```
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
+    *   **Code**: 404 Not Found (session not found or not owned)
+    *   **Code**: 422 Unprocessable Entity (invalid `session_id` or missing question field)
     *   **Code**: 500 Internal Server Error
 
-### 13. Live Audio Transcription (WebSocket)
+### 15. Live Audio Transcription (WebSocket)
 Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
 
 *   **URL**: `/listen`
@@ -391,12 +453,38 @@ curl -X POST "http://localhost:8000/ocr" \
      -F "provider=gemini"
 ```
 
-### Analyse Screen
+### Save interview profile
 ```bash
-curl -X POST "http://localhost:8000/analyse_screen" \
+curl -X POST "http://localhost:8000/save_profile" \
+     -H "Authorization: Bearer <TOKEN>" \
+     -F "job_role=Engineer" \
+     -F "name=Primary" \
+     -F "is_default=true" \
+     -F "resume=@/path/to/resume.pdf"
+```
+
+### Start interview session
+```bash
+curl -X POST "http://localhost:8000/interview/session" \
+     -H "Authorization: Bearer <TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{"profile_id":"<PROFILE_UUID>","job_title":"Role","job_description":"..."}'
+```
+
+### Analyse screen
+```bash
+curl -X POST "http://localhost:8000/analyse-screen?provider=openai" \
      -H "Authorization: Bearer <TOKEN>" \
      -F "file=@/path/to/your/screenshot.png" \
-     -F "provider=openai"
+     -F "session_id=<SESSION_UUID>"
+```
+
+### AI answer
+```bash
+curl -X POST "http://localhost:8000/ai-answer" \
+     -H "Authorization: Bearer <TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{"session_id":"<SESSION_UUID>","question":"Summarize STAR method"}'
 ```
 
 ---
@@ -420,3 +508,37 @@ curl -X POST "http://localhost:8000/analyse_screen" \
 | `query`      | `text`                   | User's message |
 | `response`   | `text`                   | AI's response |
 | `created_at` | `timestamp with timezone`| Timestamp of the message |
+
+### `interview_profiles` Table
+| Column       | Type                     | Description |
+|--------------|--------------------------|-------------|
+| `id`         | `uuid` (PK)              | Profile ID |
+| `user_id`    | `uuid`                   | Authenticated user |
+| `name`       | `text`                   | Profile label |
+| `role`       | `text`                   | Job role (`job_role` in the API maps here) |
+| `resume_text`| `text`                   | Resume body or uploaded file URL |
+| `is_default` | `boolean`                | Default profile flag |
+| `sort_order` | `integer`                | Display order |
+| `created_at` | `timestamp with timezone`| Creation timestamp |
+| `updated_at` | `timestamp with timezone`| Last update timestamp |
+
+### `interview_sessions` Table
+| Column            | Type                     | Description |
+|-------------------|--------------------------|-------------|
+| `id`              | `uuid` (PK)              | Session ID |
+| `user_id`         | `uuid`                   | Authenticated user |
+| `profile_id`      | `uuid` (FK, nullable)    | `interview_profiles.id` |
+| `started_at`      | `timestamp with timezone`| Session start |
+| `ended_at`        | `timestamp with timezone`| Session end (optional) |
+| `job_title`       | `text`                   | Job title for this session |
+| `job_description` | `text`                   | Job description |
+
+### `interview_responses` Table
+| Column       | Type                     | Description |
+|--------------|--------------------------|-------------|
+| `id`         | `uuid` (PK)              | Row ID |
+| `session_id` | `uuid`                   | `interview_sessions.id` |
+| `query`      | `text`                   | Extracted text (screen) or user question (transcript) |
+| `response`   | `text`                   | LLM answer |
+| `query_type` | `text`                   | `screen` or `transcript` |
+| `created_at` | `timestamp with timezone`| Creation timestamp |

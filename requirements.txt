@@ -13,3 +13,5 @@ beautifulsoup4
 requests
 deepgram-sdk
 websockets
+pymupdf
+python-docx
