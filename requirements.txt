@@ -1,6 +1,8 @@
 fastapi
 uvicorn
-supabase
+asyncpg
+PyJWT
+cryptography
 python-dotenv
 pydantic-settings
 openai

@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, WebSocket, WebSocketDisconnect, Request
+from fastapi.staticfiles import StaticFiles
 from typing import Optional
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
@@ -10,6 +11,7 @@ import logging
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pathlib import Path
 from modules.auth import sign_up_user, login_user, get_user
 from modules.chat import get_user_threads, get_thread_chats, create_thread, save_chat_message, delete_thread
 from modules.llm import stream_openai, stream_gemini
@@ -33,6 +35,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 class AuthRequest(BaseModel):
     email: str
@@ -150,6 +156,7 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
 
 @app.post("/upload")
 async def upload_file(
+    request: Request,
     thread_id: str,
     file: UploadFile = File(...),
     authorization: str = Header(None)
@@ -173,7 +180,7 @@ async def upload_file(
 
         # Upload to Supabase Storage
         logger.info(f"[/upload] Calling upload_to_supabase for '{file.filename}'...")
-        public_url = await upload_to_supabase(file)
+        public_url = await upload_to_supabase(file, base_url=str(request.base_url))
         logger.info(f"[/upload] upload_to_supabase returned: {public_url}")
 
         if not public_url:

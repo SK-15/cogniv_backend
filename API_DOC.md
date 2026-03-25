@@ -225,7 +225,7 @@ Upload a file to a specific thread.
         ```json
         {
           "message": "File uploaded and processed",
-          "url": "https://supabase-storage-url..."
+          "url": "http://localhost:8000/uploads/<FILENAME>"
         }
         ```
 *   **Error Response**:
@@ -407,7 +407,7 @@ curl -X POST "http://localhost:8000/analyse_screen" \
 | Column       | Type                     | Description |
 |--------------|--------------------------|-------------|
 | `id`         | `uuid` (PK)              | Unique thread ID |
-| `user_id`    | `uuid` (FK)              | Reference to `auth.users` |
+| `user_id`    | `uuid` (FK)              | Reference to `neon_auth."user"` |
 | `title`      | `text`                   | Title of the conversation |
 | `created_at` | `timestamp with timezone`| Creation timestamp |
 | `updated_at` | `timestamp with timezone`| Last update timestamp |
