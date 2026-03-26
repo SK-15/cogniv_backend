@@ -3,6 +3,25 @@ from uuid import UUID
 from modules.database import get_pool
 
 
+async def get_interview_profiles(user_id: str) -> list[dict]:
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, user_id, name, role, resume_text, is_default, sort_order, created_at, updated_at
+                FROM public.interview_profiles
+                WHERE user_id = $1::uuid
+                ORDER BY is_default DESC, sort_order ASC, created_at DESC
+                """,
+                user_id,
+            )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"Error fetching interview profiles: {e}")
+        return []
+
+
 async def save_interview_profile(
     user_id: str,
     job_role: str,

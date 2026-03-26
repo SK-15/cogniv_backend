@@ -23,6 +23,7 @@ from modules.ocr import extract_structured_text, extract_text
 from modules.llm import generate_response
 from modules.resume_text import extract_resume_text, ResumeTextExtractionError
 from modules.interview import (
+    get_interview_profiles,
     save_interview_profile,
     create_interview_session,
     insert_interview_response,
@@ -416,6 +417,12 @@ async def save_profile(
     if not row:
         raise HTTPException(status_code=500, detail="Failed to save profile")
     return row
+
+
+@app.get("/interview/profiles")
+async def list_interview_profiles(user_id: str = Depends(require_user_id)):
+    profiles = await get_interview_profiles(user_id)
+    return {"profiles": profiles}
 
 
 @app.post("/interview/session")
