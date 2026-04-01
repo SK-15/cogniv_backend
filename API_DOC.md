@@ -272,7 +272,37 @@ Save an interview profile (job role, display name, resume file, default flag) fo
     *   **Code**: 422 Unprocessable Entity (invalid resume type)
     *   **Code**: 500 Internal Server Error
 
-### 12. Start Interview Session
+### 12. List Interview Profiles
+Get all interview profiles for the authenticated user.
+
+*   **URL**: `/interview/profiles`
+*   **Method**: `GET`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "profiles": [
+            {
+              "id": "profile-uuid",
+              "user_id": "user-uuid",
+              "name": "Primary",
+              "role": "Backend Engineer",
+              "resume_text": "Extracted resume text...",
+              "is_default": true,
+              "sort_order": 0,
+              "created_at": "timestamp",
+              "updated_at": "timestamp"
+            }
+          ]
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+
+### 13. Start Interview Session
 Create a session for a given profile and job context. The profile must belong to the authenticated user.
 
 *   **URL**: `/interview/session`
@@ -301,7 +331,7 @@ Create a session for a given profile and job context. The profile must belong to
     *   **Code**: 404 Not Found (profile missing or not owned by user)
     *   **Code**: 422 Unprocessable Entity (invalid `profile_id`)
 
-### 13. Analyse Screen (Text Extraction & Q&A)
+### 14. Analyse Screen (Text Extraction & Q&A)
 Extract raw text from an uploaded image and then use an LLM to answer any questions identified within that text. Persists `query` (extracted text), `response` (LLM answer), and `query_type` = `screen` on `interview_responses` for the given session.
 
 *   **URL**: `/analyse-screen`
@@ -329,7 +359,7 @@ Extract raw text from an uploaded image and then use an LLM to answer any questi
     *   **Code**: 422 Unprocessable Entity (invalid `session_id`)
     *   **Code**: 500 Internal Server Error
 
-### 14. AI Answer
+### 15. AI Answer
 Answer a question using OpenAI. Persists `query` (question), `response` (answer), and `query_type` = `transcript` on `interview_responses` for the given session.
 
 *   **URL**: `/ai-answer`
@@ -360,7 +390,7 @@ Answer a question using OpenAI. Persists `query` (question), `response` (answer)
     *   **Code**: 422 Unprocessable Entity (invalid `session_id` or missing question field)
     *   **Code**: 500 Internal Server Error
 
-### 15. Live Audio Transcription (WebSocket)
+### 16. Live Audio Transcription (WebSocket)
 Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
 
 *   **URL**: `/listen`
@@ -461,6 +491,12 @@ curl -X POST "http://localhost:8000/save_profile" \
      -F "name=Primary" \
      -F "is_default=true" \
      -F "resume=@/path/to/resume.pdf"
+```
+
+### List interview profiles
+```bash
+curl -X GET "http://localhost:8000/interview/profiles" \
+     -H "Authorization: Bearer <TOKEN>"
 ```
 
 ### Start interview session

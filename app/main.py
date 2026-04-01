@@ -28,6 +28,7 @@ from modules.interview import (
     create_interview_session,
     insert_interview_response,
 )
+from modules.launch_signup import insert_launch_signup
 
 logging.basicConfig(
     level=logging.INFO,
@@ -96,6 +97,13 @@ class InterviewSessionRequest(BaseModel):
     job_description: str
 
 
+class LaunchSignupRequest(BaseModel):
+    email: str
+    phone: str
+    name: str
+    profession: str
+
+
 class AIAnswerRequest(BaseModel):
     session_id: str
     question: Optional[str] = None
@@ -132,6 +140,30 @@ async def login(request: AuthRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.post("/launch_signup")
+async def launch_signup(request: LaunchSignupRequest):
+    try:
+        row = await insert_launch_signup(
+            request.email,
+            request.phone,
+            request.name,
+            request.profession,
+        )
+    except Exception as e:
+        logger.exception("launch_signup insert failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "message": "Launch signup recorded",
+        "id": str(row["id"]),
+        "email": row["email"],
+        "phone": row["phone"],
+        "name": row["name"],
+        "profession": row["profession"],
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+    }
+
 
 @app.post("/new_chat")
 async def new_chat(request: NewChatRequest, authorization: str = Header(None)):
