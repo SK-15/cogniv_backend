@@ -142,6 +142,14 @@ async def login(request: AuthRequest):
         raise HTTPException(status_code=401, detail=str(e))
 
 
+@app.get("/deepgram/api_key")
+async def get_deepgram_api_key(_user_id: str = Depends(require_user_id)):
+    """Return the Deepgram API key for client-side streaming. Requires a valid Bearer token."""
+    if not settings.deepgram_api_key:
+        raise HTTPException(status_code=503, detail="Deepgram API key not configured")
+    return {"deepgram_api_key": settings.deepgram_api_key}
+
+
 @app.post("/launch_signup")
 async def launch_signup(request: LaunchSignupRequest):
     try:
