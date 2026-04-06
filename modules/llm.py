@@ -8,10 +8,12 @@ openai.api_key = settings.openai_api_key
 # Configure Gemini
 genai.configure(api_key=settings.gemini_api_key)
 
-async def stream_openai(prompt: str, history: list = None):
+async def stream_openai(prompt: str, history: list = None, system_prompt: str | None = None):
     client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
     
     messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
     if history:
         for chat in history:
             messages.append({"role": "user", "content": chat["query"]})
@@ -28,7 +30,7 @@ async def stream_openai(prompt: str, history: list = None):
         if chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
 
-async def stream_gemini(prompt: str, history: list = None):
+async def stream_gemini(prompt: str, history: list = None, system_prompt: str | None = None):
     model = genai.GenerativeModel("gemini-pro")
     
     chat_history = []
@@ -38,7 +40,10 @@ async def stream_gemini(prompt: str, history: list = None):
             chat_history.append({"role": "model", "parts": [chat["response"]]})
 
     chat = model.start_chat(history=chat_history)
-    response = await chat.send_message_async(prompt, stream=True)
+    final_prompt = prompt
+    if system_prompt:
+        final_prompt = f"{system_prompt}\n\nUser question:\n{prompt}"
+    response = await chat.send_message_async(final_prompt, stream=True)
     async for chunk in response:
         if chunk.text:
             yield chunk.text

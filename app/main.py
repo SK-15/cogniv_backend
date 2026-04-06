@@ -8,6 +8,7 @@ from deepgram.core.events import EventType
 from modules.config import settings
 
 import asyncio
+import json
 
 import logging
 from fastapi.responses import StreamingResponse
@@ -20,13 +21,14 @@ from modules.llm import stream_openai, stream_gemini
 from modules.websearch import web_search_task
 from modules.storage import upload_to_supabase
 from modules.ocr import extract_structured_text, extract_text
-from modules.llm import generate_response
 from modules.resume_text import extract_resume_text, ResumeTextExtractionError
 from modules.interview import (
     get_interview_profiles,
     save_interview_profile,
     create_interview_session,
     insert_interview_response,
+    interview_session_belongs_to_user,
+    get_session_prompt_context,
 )
 from modules.launch_signup import insert_launch_signup
 
@@ -109,6 +111,7 @@ class AIAnswerRequest(BaseModel):
     question: Optional[str] = None
     query: Optional[str] = None
     text: Optional[str] = None
+    provider: str = "openai"  # "openai" or "gemini"
 
     def get_question(self) -> str:
         q = self.question or self.query or self.text
@@ -494,56 +497,62 @@ async def analyse_screen(
     user_id: str = Depends(require_user_id),
 ):
     """
-    Extract text from an image and use an LLM to answer any questions found within.
+    Extract text from an image and stream an LLM answer (same transport as /chat).
+    The first line of the response body is a JSON object: {"extracted_text": "..."}.
+    Remaining bytes are the streamed answer text.
     """
     try:
         session_uuid = UUID(session_id)
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid session_id")
 
+    if not await interview_session_belongs_to_user(user_id, session_uuid):
+        raise HTTPException(status_code=404, detail="Session not found")
+
     try:
-        # 1. Read image bytes
         image_bytes = await file.read()
         mime_type = file.content_type or "image/jpeg"
-        
-        # 2. Extract plain text from image
+
         logger.info(f"[/analyse_screen] Extracting text using {provider}")
         extracted_text = await extract_text(
             image_bytes=image_bytes,
             mime_type=mime_type,
-            provider=provider
+            provider=provider,
         )
-        
+
         if not extracted_text:
             raise HTTPException(status_code=500, detail="Failed to extract text from the image")
-            
-        # 3. Use LLM to answer questions
-        logger.info("[/analyse_screen] Text extracted, querying LLM for answers")
+
+        logger.info("[/analyse_screen] Text extracted, streaming LLM answers")
         prompt = (
             "Here is the text extracted from an image:\n\n"
             f"```text\n{extracted_text}\n```\n\n"
             "Please carefully review this text, identify any questions or problems present in it, and provide step-by-step answers or solutions to those questions."
         )
-        
-        llm_response = await generate_response(prompt, model_type=provider)
-        
-        if not llm_response:
-            raise HTTPException(status_code=500, detail="LLM failed to generate a response")
 
-        saved = await insert_interview_response(
-            user_id,
-            session_uuid,
-            extracted_text,
-            llm_response,
-            "screen",
-        )
-        if not saved:
-            raise HTTPException(status_code=404, detail="Session not found")
+        async def generate_and_save():
+            full_response = ""
+            yield json.dumps({"extracted_text": extracted_text}, ensure_ascii=False) + "\n"
+            generator_func = stream_gemini(prompt) if provider == "gemini" else stream_openai(prompt)
+            try:
+                async for chunk in generator_func:
+                    full_response += chunk
+                    yield chunk
+            except Exception as e:
+                logger.error(f"[/analyse_screen] Stream error: {e}")
+            finally:
+                if full_response:
+                    asyncio.create_task(
+                        insert_interview_response(
+                            user_id,
+                            session_uuid,
+                            extracted_text,
+                            full_response,
+                            "screen",
+                        )
+                    )
 
-        return {
-            "extracted_text": extracted_text,
-            "answers": llm_response,
-        }
+        return StreamingResponse(generate_and_save(), media_type="text/event-stream")
 
     except HTTPException:
         raise
@@ -563,22 +572,66 @@ async def ai_answer(
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid session_id")
 
-        question = request.get_question()
-        answer = await generate_response(question, model_type="openai")
-        if answer is None:
-            raise HTTPException(status_code=500, detail="Failed to generate AI response")
-
-        saved = await insert_interview_response(
-            user_id,
-            session_uuid,
-            question,
-            answer,
-            "transcript",
-        )
-        if not saved:
+        if not await interview_session_belongs_to_user(user_id, session_uuid):
             raise HTTPException(status_code=404, detail="Session not found")
 
-        return {"answer": answer}
+        question = request.get_question()
+        ctx = await get_session_prompt_context(user_id, session_uuid)
+        if not ctx:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        resume_text = (ctx.get("resume_text") or "").strip()
+        job_title = (ctx.get("job_title") or "").strip()
+        job_description = (ctx.get("job_description") or "").strip()
+
+        # Keep prompts bounded to reduce token blow-ups.
+        if len(resume_text) > 6000:
+            resume_text = resume_text[:6000] + "\n\n[...resume truncated...]"
+        if len(job_description) > 4000:
+            job_description = job_description[:4000] + "\n\n[...job description truncated...]"
+
+        system_prompt = (
+            "You are an interview candidate. Answer the interviewer's question clearly and naturally, "
+            "in first person, as if speaking out loud in a real interview. "
+            "Be confident but not arrogant. Keep it concise but complete.\n\n"
+            "Use the following context about the candidate and the role. Use it to tailor the answer, "
+            "but do not mention that you were given a resume or job description.\n\n"
+            f"Target role title:\n{job_title or '[not provided]'}\n\n"
+            f"Target role description:\n{job_description or '[not provided]'}\n\n"
+            f"Candidate resume:\n{resume_text or '[not provided]'}\n\n"
+            "Answer format guidelines:\n"
+            "- Speak in natural language (no markdown headings).\n"
+            "- Prefer 1–3 short paragraphs.\n"
+            "- When helpful, include a brief STAR-style example using the candidate's background.\n"
+            "- If information is missing, make a reasonable assumption and keep going.\n"
+        )
+
+        async def generate_and_save():
+            full_response = ""
+            generator_func = (
+                stream_gemini(question, system_prompt=system_prompt)
+                if request.provider == "gemini"
+                else stream_openai(question, system_prompt=system_prompt)
+            )
+            try:
+                async for chunk in generator_func:
+                    full_response += chunk
+                    yield chunk
+            except Exception as e:
+                logger.error(f"[/ai-answer] Stream error: {e}")
+            finally:
+                if full_response:
+                    asyncio.create_task(
+                        insert_interview_response(
+                            user_id,
+                            session_uuid,
+                            question,
+                            full_response,
+                            "transcript",
+                        )
+                    )
+
+        return StreamingResponse(generate_and_save(), media_type="text/event-stream")
     except HTTPException:
         raise
     except Exception as e:

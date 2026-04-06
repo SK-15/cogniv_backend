@@ -95,6 +95,53 @@ async def create_interview_session(
         return None
 
 
+async def interview_session_belongs_to_user(user_id: str, session_id: UUID) -> bool:
+    """True if interview_sessions row exists for this id and user."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT 1
+                FROM public.interview_sessions
+                WHERE id = $1 AND user_id = $2::uuid
+                """,
+                session_id,
+                user_id,
+            )
+        return row is not None
+    except Exception as e:
+        print(f"Error checking interview session: {e}")
+        return False
+
+
+async def get_session_prompt_context(user_id: str, session_id: UUID) -> dict | None:
+    """
+    Returns resume + job context for a session owned by user.
+    Shape: { "resume_text": str|None, "job_title": str|None, "job_description": str|None }
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    p.resume_text,
+                    s.job_title,
+                    s.job_description
+                FROM public.interview_sessions s
+                LEFT JOIN public.interview_profiles p ON p.id = s.profile_id
+                WHERE s.id = $1 AND s.user_id = $2::uuid
+                """,
+                session_id,
+                user_id,
+            )
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"Error fetching interview session context: {e}")
+        return None
+
+
 async def insert_interview_response(
     user_id: str,
     session_id: UUID,
