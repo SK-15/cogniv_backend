@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
 from modules.auth import sign_up_user, login_user, get_user
+from modules.auth_google import router as google_router
 from modules.chat import get_user_threads, get_thread_chats, create_thread, save_chat_message, delete_thread
 from modules.llm import stream_openai, stream_gemini
 from modules.websearch import web_search_task
@@ -47,6 +48,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(google_router)
 
 UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)

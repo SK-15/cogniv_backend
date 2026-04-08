@@ -15,3 +15,5 @@ deepgram-sdk
 websockets
 pymupdf
 python-docx
+httpx
+itsdangerous

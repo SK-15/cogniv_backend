@@ -165,9 +165,13 @@ async def login_user(email: str, password: str):
 async def get_user(token: str):
     """
     Validate the JWT and return an object shaped like Supabase auth.get_user().
+
+    Validation order:
+    1. Opaque Neon Auth session token  (neon_auth.session table lookup)
+    2. EdDSA JWT issued by Neon Auth   (JWKS verification)
+    3. HS256 JWT issued by this app    (Google OAuth flow, signed with APP_SECRET_KEY)
     """
-    # Neon Auth's REST sign-in responses return a session token (opaque),
-    # not necessarily a JWT. We can map it to a user via `neon_auth.session`.
+    # 1. Opaque session token lookup
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -184,11 +188,22 @@ async def get_user(token: str):
         if row and row.get("userId"):
             return SimpleNamespace(user=SimpleNamespace(id=str(row["userId"])))
     except Exception:
-        # Fall back to JWT verification (in case a JWT was provided instead).
         pass
 
+    # 2. EdDSA JWT from Neon Auth JWKS
     user_id = await _validate_token(token)
-    if not user_id:
-        return SimpleNamespace(user=None)
+    if user_id:
+        return SimpleNamespace(user=SimpleNamespace(id=user_id))
 
-    return SimpleNamespace(user=SimpleNamespace(id=user_id))
+    # 3. HS256 JWT minted by this app's Google OAuth flow
+    try:
+        app_secret = settings.app_secret_key
+        if app_secret:
+            payload = jwt.decode(token, app_secret, algorithms=["HS256"])
+            sub = payload.get("sub")
+            if sub:
+                return SimpleNamespace(user=SimpleNamespace(id=sub))
+    except PyJWTError:
+        pass
+
+    return SimpleNamespace(user=None)
