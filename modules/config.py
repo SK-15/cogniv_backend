@@ -1,16 +1,18 @@
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     neon_database_url: str
     neon_auth_base_url: str
     openai_api_key: str = ""
-    gemini_api_key: str = ""
+    # Accepts both GEMINI_API_KEY and GENAI_API_KEY from the environment
+    gemini_api_key: str = Field(default="", validation_alias=AliasChoices("GEMINI_API_KEY", "GENAI_API_KEY"))
     deepgram_api_key: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = ""
     app_secret_key: str = ""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
 settings = Settings()

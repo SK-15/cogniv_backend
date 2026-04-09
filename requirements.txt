@@ -6,7 +6,7 @@ cryptography
 python-dotenv
 pydantic-settings
 openai
-google-generativeai
+google-genai
 python-multipart
 ddgs
 beautifulsoup4

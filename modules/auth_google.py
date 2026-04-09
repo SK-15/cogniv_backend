@@ -1,4 +1,3 @@
-import uuid
 import urllib.parse
 import datetime
 
@@ -41,12 +40,16 @@ async def _find_or_create_user(email: str, name: str) -> dict:
     if row:
         return {"id": str(row["id"]), "email": row["email"]}
 
-    new_id = str(uuid.uuid4())
-    await execute(
-        'INSERT INTO neon_auth."user" (id, email, name) VALUES ($1, $2, $3)',
-        new_id, email, name,
+    # Let the DB generate the id; supply emailVerified=true since Google has verified it.
+    new_row = await fetch_one(
+        '''
+        INSERT INTO neon_auth."user" (name, email, "emailVerified")
+        VALUES ($1, $2, true)
+        RETURNING id, email
+        ''',
+        name, email,
     )
-    return {"id": new_id, "email": email}
+    return {"id": str(new_row["id"]), "email": new_row["email"]}
 
 
 @router.get("/auth/google/start")
