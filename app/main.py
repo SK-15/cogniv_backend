@@ -156,6 +156,14 @@ async def get_deepgram_api_key(_user_id: str = Depends(require_user_id)):
     return {"deepgram_api_key": settings.deepgram_api_key}
 
 
+@app.get("/gemini/api_key")
+async def get_gemini_api_key(_user_id: str = Depends(require_user_id)):
+    """Return the Gemini API key for client-side use. Requires a valid Bearer token."""
+    if not settings.gemini_api_key:
+        raise HTTPException(status_code=503, detail="Gemini API key not configured")
+    return {"gemini_api_key": settings.gemini_api_key}
+
+
 @app.post("/launch_signup")
 async def launch_signup(request: LaunchSignupRequest):
     try:
@@ -594,19 +602,18 @@ async def ai_answer(
             job_description = job_description[:4000] + "\n\n[...job description truncated...]"
 
         system_prompt = (
-            "You are an interview candidate. Answer the interviewer's question clearly and naturally, "
-            "in first person, as if speaking out loud in a real interview. "
-            "Be confident but not arrogant. Keep it concise but complete.\n\n"
-            "Use the following context about the candidate and the role. Use it to tailor the answer, "
-            "but do not mention that you were given a resume or job description.\n\n"
-            f"Target role title:\n{job_title or '[not provided]'}\n\n"
+            "You are a precise, concise assistant helping someone answer interview questions. "
+            "Answer the question directly and completely, in bullet points, with no fluff, preamble, or filler phrases.\n\n"
+            "Rules:\n"
+            "- Always respond in bullet points (use '-' prefix).\n"
+            "- No introductory sentences like 'Great question' or 'Sure, here is...'.\n"
+            "- No closing remarks or summaries.\n"
+            "- Be specific and substantive — avoid vague platitudes.\n"
+            "- Use the candidate's resume and job description below ONLY when they add relevant detail. "
+            "Do not mention or reference that you were given a resume or job description.\n\n"
+            f"Target role title: {job_title or '[not provided]'}\n\n"
             f"Target role description:\n{job_description or '[not provided]'}\n\n"
-            f"Candidate resume:\n{resume_text or '[not provided]'}\n\n"
-            "Answer format guidelines:\n"
-            "- Speak in natural language (no markdown headings).\n"
-            "- Prefer 1–3 short paragraphs.\n"
-            "- When helpful, include a brief STAR-style example using the candidate's background.\n"
-            "- If information is missing, make a reasonable assumption and keep going.\n"
+            f"Candidate resume:\n{resume_text or '[not provided]'}\n"
         )
 
         async def generate_and_save():

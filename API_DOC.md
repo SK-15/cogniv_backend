@@ -359,6 +359,8 @@ Extract raw text from an uploaded image, then **stream** an LLM answer for any q
 ### 15. AI Answer (Streaming)
 Answer a question using OpenAI or Gemini with a **streaming** response (same as `/chat`). Persists `query` (question), `response` (full answer after the stream completes), and `query_type` = `transcript` on `interview_responses` for the given session.
 
+**Response style:** Answers are formatted as bullet points with no preamble or fluff. Resume and job description context from the session is used when relevant.
+
 *   **URL**: `/ai-answer`
 *   **Method**: `POST`
 *   **Headers**:
@@ -385,7 +387,26 @@ Answer a question using OpenAI or Gemini with a **streaming** response (same as 
     *   **Code**: 422 Unprocessable Entity (invalid `session_id` or missing question field)
     *   **Code**: 500 Internal Server Error
 
-### 16. Live Audio Transcription (WebSocket)
+### 16. Get Gemini API Key
+Return the server-side Gemini API key for client-side use.
+
+*   **URL**: `/gemini/api_key`
+*   **Method**: `GET`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "gemini_api_key": "AIza..."
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 503 Service Unavailable (key not configured in .env)
+
+### 17. Live Audio Transcription (WebSocket)
 Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
 
 *   **URL**: `/listen`
