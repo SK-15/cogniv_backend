@@ -207,3 +207,23 @@ async def get_user(token: str):
         pass
 
     return SimpleNamespace(user=None)
+
+
+async def get_auth_user_row(user_id: str) -> dict | None:
+    """
+    Load neon_auth user row for dashboard (id, email, name).
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, email, name
+                FROM neon_auth."user"
+                WHERE id = $1::uuid
+                """,
+                user_id,
+            )
+        return dict(row) if row else None
+    except Exception:
+        return None

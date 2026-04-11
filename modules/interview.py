@@ -3,22 +3,89 @@ from uuid import UUID
 from modules.database import get_pool
 
 
-async def get_interview_profiles(user_id: str) -> list[dict]:
+async def get_interview_profiles(
+    user_id: str,
+    *,
+    include_resume: bool = True,
+) -> list[dict]:
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            if include_resume:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, user_id, name, role, resume_text, is_default, sort_order,
+                           created_at, updated_at
+                    FROM public.interview_profiles
+                    WHERE user_id = $1::uuid
+                    ORDER BY is_default DESC, sort_order ASC, created_at DESC
+                    """,
+                    user_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, user_id, name, role, is_default, sort_order,
+                           created_at, updated_at
+                    FROM public.interview_profiles
+                    WHERE user_id = $1::uuid
+                    ORDER BY is_default DESC, sort_order ASC, created_at DESC
+                    """,
+                    user_id,
+                )
+        out = [dict(r) for r in rows]
+        if not include_resume:
+            for d in out:
+                d["resume_text"] = None
+        return out
+    except Exception as e:
+        print(f"Error fetching interview profiles: {e}")
+        return []
+
+
+async def list_interview_sessions(
+    user_id: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    """
+    Past interview sessions for the user, newest first.
+    Joins profile name for dashboard display.
+    """
+    if limit < 1:
+        limit = 1
+    if limit > 100:
+        limit = 100
+    if offset < 0:
+        offset = 0
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, user_id, name, role, resume_text, is_default, sort_order, created_at, updated_at
-                FROM public.interview_profiles
-                WHERE user_id = $1::uuid
-                ORDER BY is_default DESC, sort_order ASC, created_at DESC
+                SELECT
+                    s.id,
+                    s.user_id,
+                    s.profile_id,
+                    s.started_at,
+                    s.ended_at,
+                    s.job_title,
+                    s.job_description,
+                    p.name AS profile_name
+                FROM public.interview_sessions s
+                LEFT JOIN public.interview_profiles p ON p.id = s.profile_id
+                WHERE s.user_id = $1::uuid
+                ORDER BY s.started_at DESC NULLS LAST, s.id DESC
+                LIMIT $2 OFFSET $3
                 """,
                 user_id,
+                limit,
+                offset,
             )
         return [dict(r) for r in rows]
     except Exception as e:
-        print(f"Error fetching interview profiles: {e}")
+        print(f"Error listing interview sessions: {e}")
         return []
 
 

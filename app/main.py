@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
-from modules.auth import sign_up_user, login_user, get_user
+from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row
 from modules.auth_google import router as google_router
 from modules.chat import get_user_threads, get_thread_chats, create_thread, save_chat_message, delete_thread
 from modules.llm import stream_openai, stream_gemini
@@ -25,6 +25,7 @@ from modules.ocr import extract_structured_text, extract_text
 from modules.resume_text import extract_resume_text, ResumeTextExtractionError
 from modules.interview import (
     get_interview_profiles,
+    list_interview_sessions,
     save_interview_profile,
     create_interview_session,
     insert_interview_response,
@@ -473,10 +474,44 @@ async def save_profile(
     return row
 
 
+@app.get("/user/me")
+async def get_current_user_profile(user_id: str = Depends(require_user_id)):
+    """
+    Auth account for the dashboard (email, name from neon_auth.user).
+    """
+    row = await get_auth_user_row(user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "id": str(row["id"]),
+        "email": row.get("email"),
+        "name": row.get("name"),
+    }
+
+
 @app.get("/interview/profiles")
-async def list_interview_profiles(user_id: str = Depends(require_user_id)):
-    profiles = await get_interview_profiles(user_id)
+async def list_interview_profiles(
+    user_id: str = Depends(require_user_id),
+    include_resume: bool = Query(
+        True,
+        description="If false, omits resume text (lighter payload for listings).",
+    ),
+):
+    profiles = await get_interview_profiles(user_id, include_resume=include_resume)
     return {"profiles": profiles}
+
+
+@app.get("/interview/sessions")
+async def list_past_interview_sessions(
+    user_id: str = Depends(require_user_id),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Previous interview sessions for the authenticated user, newest first.
+    """
+    sessions = await list_interview_sessions(user_id, limit=limit, offset=offset)
+    return {"sessions": sessions, "limit": limit, "offset": offset}
 
 
 @app.post("/interview/session")
