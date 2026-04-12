@@ -13,10 +13,10 @@ import json
 import logging
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pathlib import Path
-from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row
-from modules.auth_google import router as google_router
+from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row, refresh_neon_auth_session
+from modules.auth_google import router as google_router, refresh_google_oauth_tokens
 from modules.chat import get_user_threads, get_thread_chats, create_thread, save_chat_message, delete_thread
 from modules.llm import stream_openai, stream_gemini
 from modules.websearch import web_search_task
@@ -82,6 +82,14 @@ class AuthRequest(BaseModel):
     email: str
     password: str
 
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+    provider: Optional[str] = Field(
+        None,
+        description="`neon`, `google`, or omit for `auto` (try Neon Auth, then Google).",
+    )
+
 class ChatRequest(BaseModel):
     prompt: str
     thread_id: str
@@ -142,11 +150,62 @@ async def login(request: AuthRequest):
             return {
                 "access_token": response.session.access_token,
                 "refresh_token": response.session.refresh_token,
-                "user_id": response.user.id
+                "user_id": response.user.id,
             }
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+@app.post("/refresh")
+async def refresh_session(body: RefreshTokenRequest):
+    """
+    Obtain new access (and possibly refresh) tokens using a refresh token.
+    Neon Auth (email/password) and Google OAuth (Electron loopback) use different refresh tokens;
+    pass `provider` or leave `auto` to try Neon Auth first, then Google.
+    """
+    rt = (body.refresh_token or "").strip()
+    if not rt:
+        raise HTTPException(status_code=422, detail="refresh_token is required")
+
+    mode = (body.provider or "auto").strip().lower()
+    if mode not in ("auto", "neon", "google"):
+        raise HTTPException(
+            status_code=422,
+            detail="provider must be 'auto', 'neon', or 'google'",
+        )
+
+    if mode == "google":
+        out = await refresh_google_oauth_tokens(rt)
+        if not out:
+            raise HTTPException(status_code=401, detail="Refresh failed")
+        return {**out, "provider": "google"}
+
+    if mode == "neon":
+        response = await refresh_neon_auth_session(rt)
+        if not response or not response.session or not response.user:
+            raise HTTPException(status_code=401, detail="Refresh failed")
+        return {
+            "access_token": response.session.access_token,
+            "refresh_token": response.session.refresh_token,
+            "user_id": response.user.id,
+            "provider": "neon",
+        }
+
+    response = await refresh_neon_auth_session(rt)
+    if response and response.session and response.user:
+        return {
+            "access_token": response.session.access_token,
+            "refresh_token": response.session.refresh_token,
+            "user_id": response.user.id,
+            "provider": "neon",
+        }
+
+    out = await refresh_google_oauth_tokens(rt)
+    if out:
+        return {**out, "provider": "google"}
+
+    raise HTTPException(status_code=401, detail="Refresh failed")
 
 
 @app.get("/deepgram/api_key")

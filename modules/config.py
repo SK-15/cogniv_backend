@@ -4,6 +4,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     neon_database_url: str
     neon_auth_base_url: str
+    # Optional full URL for Neon Auth (Better Auth) refresh, e.g. https://.../neondb/auth/refresh
+    neon_auth_refresh_url: str = ""
     openai_api_key: str = ""
     # Accepts both GEMINI_API_KEY and GENAI_API_KEY from the environment
     gemini_api_key: str = Field(default="", validation_alias=AliasChoices("GEMINI_API_KEY", "GENAI_API_KEY"))

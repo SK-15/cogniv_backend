@@ -61,10 +61,43 @@ Authenticate a user and receive access tokens.
           "user_id": "uuid-string"
         }
         ```
+        `refresh_token` is always present; it may be `null` if the identity provider did not return a refresh token.
 *   **Error Response**:
     *   **Code**: 401 Unauthorized (invalid credentials)
 
-### 3. Create New Chat (Thread)
+### 3. Refresh session tokens
+Exchange a **refresh token** for new `access_token` / `refresh_token` values. Neon Auth (email/password) and the app’s Google OAuth (Electron loopback) use different refresh tokens; set `provider` or use the default `auto` behavior.
+
+*   **URL**: `/refresh`
+*   **Method**: `POST`
+*   **Request Body**:
+    ```json
+    {
+      "refresh_token": "string",
+      "provider": "auto"
+    }
+    ```
+    *   `refresh_token`: **Required**.
+    *   `provider`: Optional. One of `neon` (Neon Auth only), `google` (Google OAuth refresh only), or `auto` / omitted (try Neon Auth first, then Google).
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "access_token": "jwt-or-session-token-string",
+          "refresh_token": "new-or-same-refresh-token",
+          "user_id": "uuid-string",
+          "provider": "neon"
+        }
+        ```
+        `provider` is `neon` or `google` so clients can store which flow to use on the next refresh.
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized (invalid or expired refresh token)
+    *   **Code**: 422 Unprocessable Entity (missing `refresh_token` or invalid `provider`)
+
+For Neon Auth, the backend calls your Better Auth base URL (see `NEON_AUTH_BASE_URL`). You can optionally set **`NEON_AUTH_REFRESH_URL`** in the environment to the full refresh endpoint if it differs from the defaults (`…/refresh`, `…/refresh-token`).
+
+### 4. Create New Chat (Thread)
 Create a new conversation thread.
 
 *   **URL**: `/new_chat`
@@ -91,7 +124,7 @@ Create a new conversation thread.
         }
         ```
 
-### 4. Chat (Streaming)
+### 5. Chat (Streaming)
 Send a message to a thread and get a streaming response.
 
 *   **URL**: `/chat`
@@ -116,7 +149,7 @@ Send a message to a thread and get a streaming response.
     *   **Code**: 401 Unauthorized
     *   **Code**: 500 Internal Server Error
 
-### 5. List Threads
+### 6. List Threads
 Get all conversation threads for the user.
 
 *   **URL**: `/threads`
@@ -139,7 +172,7 @@ Get all conversation threads for the user.
         }
         ```
 
-### 6. Get Thread History
+### 7. Get Thread History
 Get all chat messages for a specific thread.
 
 *   **URL**: `/threads/{thread_id}/chats`
@@ -162,7 +195,7 @@ Get all chat messages for a specific thread.
         }
         ```
 
-### 7. Delete Thread
+### 8. Delete Thread
 Delete a specific thread and all associated messages.
 
 *   **URL**: `/threads/{thread_id}`
@@ -183,7 +216,7 @@ Delete a specific thread and all associated messages.
     *   **Code**: 500 Internal Server Error
     *   **Code**: 500 Internal Server Error
 
-### 8. Web Search
+### 9. Web Search
 Perform a web search and get a synthesized answer.
 
 *   **URL**: `/websearch`
@@ -207,7 +240,7 @@ Perform a web search and get a synthesized answer.
 *   **Error Response**:
     *   **Code**: 500 Internal Server Error
 
-### 9. Upload File
+### 10. Upload File
 Upload a file to a specific thread.
 
 *   **URL**: `/upload`
@@ -232,7 +265,7 @@ Upload a file to a specific thread.
     *   **Code**: 401 Unauthorized
     *   **Code**: 500 Internal Server Error
 
-### 10. OCR (Structured Text Extraction)
+### 11. OCR (Structured Text Extraction)
 Perform OCR on an image and extract structured text as JSON.
 
 *   **URL**: `/ocr`
@@ -251,7 +284,7 @@ Perform OCR on an image and extract structured text as JSON.
     *   **Code**: 401 Unauthorized
     *   **Code**: 500 Internal Server Error
 
-### 11. Save Interview Profile
+### 12. Save Interview Profile
 Save an interview profile (job role, display name, resume file, default flag) for the authenticated user. The server reads the uploaded file **in-memory**, extracts plain text from the resume (PDF via PyMuPDF, DOCX via python-docx), and writes the extracted text into `interview_profiles.resume_text`. (The API form field `job_role` is stored in DB column `role`.)
 
 *   **URL**: `/save_profile`
@@ -272,13 +305,70 @@ Save an interview profile (job role, display name, resume file, default flag) fo
     *   **Code**: 422 Unprocessable Entity (invalid resume type)
     *   **Code**: 500 Internal Server Error
 
-### 12. List Interview Profiles
+### 13. Get Current User (Account)
+Return the authenticated user’s account row from `neon_auth."user"` (for dashboards: display name and email).
+
+*   **URL**: `/user/me`
+*   **Method**: `GET`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "id": "user-uuid",
+          "email": "user@example.com",
+          "name": "Jane Doe"
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 404 Not Found (user row missing)
+
+### 14. List Past Interview Sessions
+Return previous `interview_sessions` for the authenticated user, **newest first**, with the linked profile’s display name.
+
+*   **URL**: `/interview/sessions`
+*   **Method**: `GET`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+*   **Query Parameters**:
+    *   `limit`: Optional. Integer, default `50`, min `1`, max `100`.
+    *   `offset`: Optional. Integer, default `0`, min `0` (pagination).
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "sessions": [
+            {
+              "id": "session-uuid",
+              "user_id": "user-uuid",
+              "profile_id": "profile-uuid",
+              "started_at": "timestamp",
+              "ended_at": "timestamp or null",
+              "job_title": "Senior Backend Engineer",
+              "job_description": "Job description text...",
+              "profile_name": "Primary"
+            }
+          ],
+          "limit": 50,
+          "offset": 0
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+
+### 15. List Interview Profiles
 Get all interview profiles for the authenticated user.
 
 *   **URL**: `/interview/profiles`
 *   **Method**: `GET`
 *   **Headers**:
     *   `Authorization: Bearer <access_token>`
+*   **Query Parameters**:
+    *   `include_resume`: Optional. Boolean, default `true`. If `false`, each profile still includes a `resume_text` field set to `null` (omits loading full extracted text for lighter list views).
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content**:
@@ -299,10 +389,11 @@ Get all interview profiles for the authenticated user.
           ]
         }
         ```
+        When `include_resume=false`, `resume_text` is always `null`.
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
 
-### 13. Start Interview Session
+### 16. Start Interview Session
 Create a session for a given profile and job context. The profile must belong to the authenticated user.
 
 *   **URL**: `/interview/session`
@@ -331,7 +422,7 @@ Create a session for a given profile and job context. The profile must belong to
     *   **Code**: 404 Not Found (profile missing or not owned by user)
     *   **Code**: 422 Unprocessable Entity (invalid `profile_id`)
 
-### 14. Analyse Screen (Text Extraction & Q&A, Streaming)
+### 17. Analyse Screen (Text Extraction & Q&A, Streaming)
 Extract raw text from an uploaded image, then **stream** an LLM answer for any questions identified in that text (same mechanism as `/chat`: `Content-Type: text/event-stream`, chunked body). Persists `query` (extracted text), `response` (full LLM answer after the stream completes), and `query_type` = `screen` on `interview_responses` for the given session.
 
 *   **URL**: `/analyse-screen`
@@ -356,7 +447,7 @@ Extract raw text from an uploaded image, then **stream** an LLM answer for any q
     *   **Code**: 422 Unprocessable Entity (invalid `session_id`)
     *   **Code**: 500 Internal Server Error
 
-### 15. AI Answer (Streaming)
+### 18. AI Answer (Streaming)
 Answer a question using OpenAI or Gemini with a **streaming** response (same as `/chat`). Persists `query` (question), `response` (full answer after the stream completes), and `query_type` = `transcript` on `interview_responses` for the given session.
 
 **Response style:** Answers are formatted as bullet points with no preamble or fluff. Resume and job description context from the session is used when relevant.
@@ -387,7 +478,7 @@ Answer a question using OpenAI or Gemini with a **streaming** response (same as 
     *   **Code**: 422 Unprocessable Entity (invalid `session_id` or missing question field)
     *   **Code**: 500 Internal Server Error
 
-### 16. Get Gemini API Key
+### 19. Get Gemini API Key
 Return the server-side Gemini API key for client-side use.
 
 *   **URL**: `/gemini/api_key`
@@ -406,7 +497,7 @@ Return the server-side Gemini API key for client-side use.
     *   **Code**: 401 Unauthorized
     *   **Code**: 503 Service Unavailable (key not configured in .env)
 
-### 17. Live Audio Transcription (WebSocket)
+### 20. Live Audio Transcription (WebSocket)
 Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
 
 *   **URL**: `/listen`
@@ -438,6 +529,13 @@ curl -X POST http://localhost:8000/signup \
 curl -X POST http://localhost:8000/login \
      -H "Content-Type: application/json" \
      -d '{"email": "test@example.com", "password": "Password123!"}'
+```
+
+### Refresh tokens
+```bash
+curl -X POST http://localhost:8000/refresh \
+     -H "Content-Type: application/json" \
+     -d '{"refresh_token":"<REFRESH_TOKEN>","provider":"auto"}'
 ```
 
 ### Create New Chat
@@ -509,9 +607,27 @@ curl -X POST "http://localhost:8000/save_profile" \
      -F "resume=@/path/to/resume.pdf"
 ```
 
+### Get current user (dashboard account)
+```bash
+curl -X GET "http://localhost:8000/user/me" \
+     -H "Authorization: Bearer <TOKEN>"
+```
+
+### List past interview sessions
+```bash
+curl -X GET "http://localhost:8000/interview/sessions?limit=50&offset=0" \
+     -H "Authorization: Bearer <TOKEN>"
+```
+
 ### List interview profiles
 ```bash
 curl -X GET "http://localhost:8000/interview/profiles" \
+     -H "Authorization: Bearer <TOKEN>"
+```
+
+### List interview profiles (without resume text)
+```bash
+curl -X GET "http://localhost:8000/interview/profiles?include_resume=false" \
      -H "Authorization: Bearer <TOKEN>"
 ```
 

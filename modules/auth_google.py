@@ -21,6 +21,59 @@ ACCESS_TOKEN_EXPIRE = datetime.timedelta(hours=1)
 _signer = URLSafeTimedSerializer(settings.app_secret_key or "fallback-key")
 
 
+async def refresh_google_oauth_tokens(refresh_token: str) -> dict | None:
+    """
+    Use Google's OAuth2 refresh_token to obtain a new app access_token (HS256) and
+    optionally a rotated Google refresh_token. Returns dict for JSON or None on failure.
+    """
+    if not refresh_token.strip():
+        return None
+    if not settings.google_client_id or not settings.google_client_secret:
+        return None
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": settings.google_client_id,
+                "client_secret": settings.google_client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+    if token_resp.status_code != 200:
+        return None
+
+    google_tokens = token_resp.json()
+    google_access = google_tokens.get("access_token")
+    if not google_access:
+        return None
+
+    async with httpx.AsyncClient() as client:
+        profile_resp = await client.get(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {google_access}"},
+        )
+    if profile_resp.status_code != 200:
+        return None
+
+    profile = profile_resp.json()
+    email = profile.get("email")
+    name = profile.get("name", "")
+    if not email:
+        return None
+
+    user = await _find_or_create_user(email=email, name=name)
+    access_token = _mint_access_token(user["id"], user["email"])
+    new_refresh = google_tokens.get("refresh_token") or refresh_token
+
+    return {
+        "access_token": access_token,
+        "refresh_token": new_refresh,
+        "user_id": user["id"],
+    }
+
+
 def _mint_access_token(user_id: str, email: str) -> str:
     now = datetime.datetime.utcnow()
     payload = {

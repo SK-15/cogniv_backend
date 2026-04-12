@@ -103,6 +103,63 @@ async def _post_json(url: str, body: dict, origin_header: str | None = None) -> 
     return await asyncio.to_thread(_do_post)
 
 
+async def _post_json_optional(
+    url: str, body: dict, origin_header: str | None = None
+) -> dict | None:
+    """POST JSON; return None on non-2xx or parse errors."""
+
+    def _do_post():
+        headers = {}
+        if origin_header:
+            headers["Origin"] = origin_header
+        resp = requests.post(url, json=body, headers=headers, timeout=20)
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+    return await asyncio.to_thread(_do_post)
+
+
+def _normalize_neon_auth_session_payload(data: dict) -> SimpleNamespace:
+    """
+    Map Neon / Better Auth sign-in or refresh JSON to user + session tokens.
+    """
+    extracted = data.get("data", data)
+    user = extracted.get("user") or {}
+
+    token_top_level = extracted.get("token")
+    session = extracted.get("session") or {}
+
+    access_token = (
+        session.get("access_token")
+        or session.get("accessToken")
+        or token_top_level
+        or session.get("token")
+        or extracted.get("accessToken")
+        or extracted.get("access_token")
+    )
+    refresh_token = (
+        session.get("refresh_token")
+        or session.get("refreshToken")
+        or extracted.get("refreshToken")
+        or extracted.get("refresh_token")
+    )
+
+    uid = user.get("id")
+    return SimpleNamespace(
+        user=SimpleNamespace(id=uid) if uid else None,
+        session=SimpleNamespace(
+            access_token=access_token,
+            refresh_token=refresh_token,
+        )
+        if access_token
+        else None,
+    )
+
+
 async def sign_up_user(email: str, password: str):
     """
     Create a new user via Neon Auth (Better Auth) email/password signup.
@@ -134,32 +191,45 @@ async def login_user(email: str, password: str):
     url = f"{settings.neon_auth_base_url}/sign-in/email"
     payload = {"email": email, "password": password}
     data = await _post_json(url, payload, origin_header=_auth_origin())
+    return _normalize_neon_auth_session_payload(data)
 
-    extracted = data.get("data", data)
-    user = extracted.get("user") or {}
 
-    # Neon Auth (Better Auth) returns token/user at the top level for these REST endpoints.
-    # We normalize it to the same shape the rest of this backend expects.
-    token_top_level = extracted.get("token")
-    session = extracted.get("session") or {}
+async def refresh_neon_auth_session(refresh_token: str) -> SimpleNamespace | None:
+    """
+    Exchange a Neon Auth refresh token for new session tokens.
+    Tries configured or default Better Auth-style /refresh URLs and body shapes.
+    """
+    if not refresh_token.strip():
+        return None
 
-    access_token = (
-        session.get("access_token")
-        or session.get("accessToken")
-        or token_top_level
-        or session.get("token")
-    )
-    refresh_token = session.get("refresh_token") or session.get("refreshToken")
-
-    return SimpleNamespace(
-        user=SimpleNamespace(id=user.get("id")) if user.get("id") else None,
-        session=SimpleNamespace(
-            access_token=access_token,
-            refresh_token=refresh_token,
+    base = settings.neon_auth_base_url.rstrip("/")
+    origin = _auth_origin()
+    configured = (settings.neon_auth_refresh_url or "").strip()
+    urls = []
+    if configured:
+        urls.append(configured)
+    else:
+        urls.extend(
+            [
+                f"{base}/refresh",
+                f"{base}/refresh-token",
+            ]
         )
-        if access_token
-        else None,
+
+    bodies = (
+        {"refreshToken": refresh_token},
+        {"refresh_token": refresh_token},
     )
+
+    for url in urls:
+        for body in bodies:
+            data = await _post_json_optional(url, body, origin_header=origin)
+            if not data:
+                continue
+            normalized = _normalize_neon_auth_session_payload(data)
+            if normalized.session:
+                return normalized
+    return None
 
 
 async def get_user(token: str):
