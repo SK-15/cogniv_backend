@@ -5,11 +5,26 @@ from modules.config import settings
 
 openai.api_key = settings.openai_api_key
 
+_openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
 _gemini_client = genai.Client(api_key=settings.gemini_api_key)
+
+DIAGRAM_KEYWORDS = {"flow", "diagram", "sequence", "architecture", "visualize", "chart", "graph", "steps", "flowchart"}
+
+DIAGRAM_SYSTEM_ADDENDUM = """
+When a visual diagram would help, output it as a mermaid code block:
+```mermaid
+graph TD
+    A --> B
+```
+Use mermaid syntax only. Supported: graph, sequenceDiagram, flowchart, classDiagram, erDiagram.
+"""
+
+def needs_diagram_hint(prompt: str) -> bool:
+    return bool(DIAGRAM_KEYWORDS & set(prompt.lower().split()))
 
 
 async def stream_openai(prompt: str, history: list = None, system_prompt: str | None = None):
-    client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
+    client = _openai_client
 
     messages = []
     if system_prompt:
@@ -20,7 +35,7 @@ async def stream_openai(prompt: str, history: list = None, system_prompt: str | 
             messages.append({"role": "assistant", "content": chat["response"]})
     messages.append({"role": "user", "content": prompt})
 
-    response = await client.chat.completions.create(
+    response = await _openai_client.chat.completions.create(
         model="gpt-4o",
         messages=messages,
         stream=True,
@@ -55,7 +70,6 @@ async def generate_response(prompt: str, model_type: str = "openai", history: li
     """
     try:
         if model_type == "openai":
-            client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
             messages = []
             if history:
                 for chat in history:
@@ -63,7 +77,7 @@ async def generate_response(prompt: str, model_type: str = "openai", history: li
                     messages.append({"role": "assistant", "content": chat["response"]})
             messages.append({"role": "user", "content": prompt})
 
-            response = await client.chat.completions.create(
+            response = await _openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=messages,
                 stream=False,

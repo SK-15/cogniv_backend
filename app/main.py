@@ -18,7 +18,8 @@ from pathlib import Path
 from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row, refresh_neon_auth_session
 from modules.auth_google import router as google_router, refresh_google_oauth_tokens
 from modules.chat import get_user_threads, get_thread_chats, create_thread, save_chat_message, delete_thread
-from modules.llm import stream_openai, stream_gemini
+from modules.llm import stream_openai, stream_gemini, needs_diagram_hint, DIAGRAM_SYSTEM_ADDENDUM, _openai_client
+from modules.agent import agent_stream
 from modules.websearch import web_search_task
 from modules.storage import upload_to_supabase
 from modules.ocr import extract_structured_text, extract_text
@@ -51,6 +52,20 @@ app.add_middleware(
 )
 
 app.include_router(google_router)
+
+
+@app.on_event("startup")
+async def warm_llm():
+    """Pre-establish OpenAI connection pool to eliminate first-request latency."""
+    try:
+        await _openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+    except Exception:
+        pass
+
 
 UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -284,24 +299,23 @@ async def chat(request: ChatRequest, authorization: str = Header(None)):
     # Fetch chat history
     history = await get_thread_chats(user_id, request.thread_id)
 
+    system_prompt = DIAGRAM_SYSTEM_ADDENDUM if needs_diagram_hint(request.prompt) else None
+
     async def generate_and_save():
         full_response = ""
-        
-        if request.provider == "gemini":
-            generator_func = stream_gemini(request.prompt, history=history)
-        else:
-            generator_func = stream_openai(request.prompt, history=history)
-            
         try:
-            async for chunk in generator_func:
+            async for chunk in agent_stream(
+                prompt=request.prompt,
+                history=history,
+                model=request.provider,
+                system_prompt=system_prompt,
+            ):
                 full_response += chunk
                 yield chunk
         except Exception as e:
             print(f"Stream error: {e}")
         finally:
-            # Save persistence after stream is done or interrupted
             if full_response:
-                # Use asyncio.create_task to ensure it runs even if request is cancelled
                 asyncio.create_task(save_chat_message(user_id, request.thread_id, request.prompt, full_response))
 
     return StreamingResponse(generate_and_save(), media_type="text/event-stream")
