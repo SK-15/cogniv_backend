@@ -6,6 +6,7 @@
 - Auth: Neon Auth (email/password) + Google OAuth — both converge at `require_user_id` dep in `app/main.py`, returns `user_id: str` (UUID as string)
 - Modules pattern: each concern lives in `modules/<name>.py`, imported into `app/main.py`
 - All DB access via helpers in `modules/database.py`: `fetch_one`, `fetch_all`, `execute`
+- Payment: **Razorpay Standard Checkout** — backend creates subscription, frontend opens checkout.js modal, backend verifies HMAC signature
 
 ## Free Tier Rules
 
@@ -18,22 +19,30 @@
 
 ## Step 1 — Database Migrations
 
-### 1a. `subscriptions` table — ALREADY EXISTS
+### 1a. `subscriptions` table — ALREADY EXISTS, needs column rename
 
-Schema:
+Rename Stripe columns to Razorpay equivalents:
+
 ```sql
-id                    UUID PRIMARY KEY DEFAULT gen_random_uuid()
-user_id               UUID UNIQUE NOT NULL REFERENCES neon_auth."user"(id) ON DELETE CASCADE
-plan_tier             TEXT NOT NULL DEFAULT 'free'         -- 'free' | 'pro'
-status                TEXT NOT NULL DEFAULT 'active'       -- 'active' | 'cancelled' | 'past_due'
-stripe_customer_id    TEXT
-stripe_subscription_id TEXT
-current_period_end    TIMESTAMP WITH TIME ZONE
-created_at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
-updated_at            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+ALTER TABLE public.subscriptions
+    RENAME COLUMN stripe_customer_id TO razorpay_customer_id;
+
+ALTER TABLE public.subscriptions
+    RENAME COLUMN stripe_subscription_id TO razorpay_subscription_id;
 ```
 
-Indexes already exist: primary key on `id`, unique on `user_id`, btree on `stripe_customer_id`.
+Updated schema reference:
+```
+id                       UUID PRIMARY KEY DEFAULT gen_random_uuid()
+user_id                  UUID UNIQUE NOT NULL REFERENCES neon_auth."user"(id) ON DELETE CASCADE
+plan_tier                TEXT NOT NULL DEFAULT 'free'         -- 'free' | 'pro'
+status                   TEXT NOT NULL DEFAULT 'active'       -- 'active' | 'cancelled' | 'past_due'
+razorpay_customer_id     TEXT
+razorpay_subscription_id TEXT
+current_period_end       TIMESTAMP WITH TIME ZONE
+created_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+updated_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+```
 
 ### 1b. `free_usage` table — CREATE THIS
 
@@ -45,7 +54,7 @@ CREATE TABLE IF NOT EXISTS public.free_usage (
 );
 ```
 
-Note: `user_id` here is TEXT (not UUID) to match how asyncpg returns neon_auth user ids as strings.
+Note: `user_id` is TEXT (not UUID) to match how asyncpg returns neon_auth user ids as strings.
 
 ### 1c. Alter `interview_sessions` — ADD COLUMN
 
@@ -54,52 +63,53 @@ ALTER TABLE public.interview_sessions
     ADD COLUMN IF NOT EXISTS duration_seconds INTEGER;
 ```
 
-Save this migration to `migrations/add_free_usage_and_session_duration.sql`.
+Save all three to `migrations/add_razorpay_and_free_usage.sql`.
 
 ---
 
 ## Step 2 — Environment Variables
 
-Add to `.env` and register in `modules/config.py`:
+Add to `.env`:
 
 ```
-STRIPE_SECRET_KEY=sk_live_...
-STRIPE_WEBHOOK_SECRET=whsec_...
-STRIPE_PRO_PRICE_ID=price_...
-STRIPE_SUCCESS_URL=https://yourapp.com/payment/success
-STRIPE_CANCEL_URL=https://yourapp.com/payment/cancel
+RAZORPAY_KEY_ID=rzp_test_SkpUjWU3TfWOeT
+RAZORPAY_KEY_SECRET=UPCYaNnQdAw7QdTtXar1zIV8
+RAZORPAY_WEBHOOK_SECRET=whsec_...
+RAZORPAY_PRO_PLAN_ID=plan_...
 ```
 
-In `modules/config.py`, add to the `Settings` class:
+Note: credentials above are test keys — replace with live keys (`rzp_live_...`) for production.
+`KEY_SECRET` must never reach the frontend.
+
+Add to `modules/config.py` `Settings` class:
 
 ```python
-stripe_secret_key: str = ""
-stripe_webhook_secret: str = ""
-stripe_pro_price_id: str = ""
-stripe_success_url: str = ""
-stripe_cancel_url: str = ""
+razorpay_key_id: str = ""
+razorpay_key_secret: str = ""
+razorpay_webhook_secret: str = ""
+razorpay_pro_plan_id: str = ""
 ```
 
 ---
 
-## Step 3 — Add stripe to requirements.txt
+## Step 3 — Add razorpay to requirements.txt
 
 ```
-stripe>=8.0.0
+razorpay>=1.4.0
 ```
 
 ---
 
 ## Step 4 — Create `modules/billing.py`
 
-This module owns all billing logic. Full implementation:
-
 ```python
-import stripe
+import hmac
+import hashlib
+import razorpay
 from modules.config import settings
 from modules.database import fetch_one, execute
 
-stripe.api_key = settings.stripe_secret_key
+rz_client = razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
 
 FREE_SESSION_LIMIT = 3
 
@@ -107,10 +117,7 @@ FREE_SESSION_LIMIT = 3
 # ── Subscription provisioning ──────────────────────────────────────────────
 
 async def provision_free_subscription(user_id: str) -> None:
-    """
-    Called after user creation (both email/password and Google OAuth).
-    INSERT OR IGNORE — safe to call on existing users.
-    """
+    """INSERT OR IGNORE — safe to call on existing users."""
     await execute(
         """
         INSERT INTO public.subscriptions (user_id)
@@ -146,13 +153,9 @@ async def get_free_usage(user_id: str) -> dict | None:
 
 
 async def check_can_start_session(user_id: str) -> dict:
-    """
-    Returns {"allowed": bool, "reason": str, "sessions_remaining": int | None}.
-    Raises nothing — callers handle the HTTP response.
-    """
+    """Returns {"allowed": bool, "reason": str, "sessions_remaining": int | None}."""
     sub = await get_subscription(user_id)
     if not sub:
-        # Auto-heal missing subscription row
         await provision_free_subscription(user_id)
         sub = await get_subscription(user_id)
 
@@ -162,7 +165,6 @@ async def check_can_start_session(user_id: str) -> dict:
     if plan == "pro" and status == "active":
         return {"allowed": True, "reason": "pro", "sessions_remaining": None}
 
-    # Free tier check
     usage = await get_free_usage(user_id)
     sessions_used = usage["sessions_used"] if usage else 0
     remaining = FREE_SESSION_LIMIT - sessions_used
@@ -170,20 +172,12 @@ async def check_can_start_session(user_id: str) -> dict:
     if remaining > 0:
         return {"allowed": True, "reason": "free", "sessions_remaining": remaining}
 
-    return {
-        "allowed": False,
-        "reason": "free_quota_exceeded",
-        "sessions_remaining": 0,
-    }
+    return {"allowed": False, "reason": "free_quota_exceeded", "sessions_remaining": 0}
 
 
 async def increment_free_sessions_used(user_id: str) -> None:
     await execute(
-        """
-        UPDATE public.free_usage
-        SET sessions_used = sessions_used + 1
-        WHERE user_id = $1
-        """,
+        "UPDATE public.free_usage SET sessions_used = sessions_used + 1 WHERE user_id = $1",
         user_id,
     )
 
@@ -191,14 +185,10 @@ async def increment_free_sessions_used(user_id: str) -> None:
 # ── Session duration ───────────────────────────────────────────────────────
 
 async def end_interview_session(user_id: str, session_id: str, duration_seconds: int) -> bool:
-    """
-    Marks session ended with duration. Returns True if row updated.
-    """
     result = await execute(
         """
         UPDATE public.interview_sessions
-        SET ended_at = now(),
-            duration_seconds = $3
+        SET ended_at = now(), duration_seconds = $3
         WHERE id = $1::uuid AND user_id = $2::uuid AND ended_at IS NULL
         """,
         session_id,
@@ -208,129 +198,147 @@ async def end_interview_session(user_id: str, session_id: str, duration_seconds:
     return result != "UPDATE 0"
 
 
-# ── Stripe helpers ─────────────────────────────────────────────────────────
+# ── Razorpay Standard Checkout ─────────────────────────────────────────────
 
-async def get_or_create_stripe_customer(user_id: str, email: str) -> str:
-    """Returns existing stripe_customer_id or creates a new one."""
+async def get_or_create_razorpay_customer(user_id: str, email: str) -> str:
+    """Returns existing razorpay_customer_id or creates new one."""
     sub = await get_subscription(user_id)
-    if sub and sub.get("stripe_customer_id"):
-        return sub["stripe_customer_id"]
+    if sub and sub.get("razorpay_customer_id"):
+        return sub["razorpay_customer_id"]
 
-    customer = stripe.Customer.create(email=email, metadata={"user_id": user_id})
+    customer = rz_client.customer.create({"email": email, "notes": {"user_id": user_id}})
     await execute(
         """
         UPDATE public.subscriptions
-        SET stripe_customer_id = $2, updated_at = now()
+        SET razorpay_customer_id = $2, updated_at = now()
         WHERE user_id = $1::uuid
         """,
         user_id,
-        customer.id,
+        customer["id"],
     )
-    return customer.id
+    return customer["id"]
 
 
-async def create_checkout_session(user_id: str, email: str) -> str:
-    """Returns Stripe checkout URL."""
-    customer_id = await get_or_create_stripe_customer(user_id, email)
-    session = stripe.checkout.Session.create(
-        customer=customer_id,
-        mode="subscription",
-        line_items=[{"price": settings.stripe_pro_price_id, "quantity": 1}],
-        success_url=settings.stripe_success_url,
-        cancel_url=settings.stripe_cancel_url,
-        metadata={"user_id": user_id},
-    )
-    return session.url
-
-
-async def create_portal_session(user_id: str) -> str | None:
-    """Returns Stripe billing portal URL or None if no customer."""
-    sub = await get_subscription(user_id)
-    if not sub or not sub.get("stripe_customer_id"):
-        return None
-    session = stripe.billing_portal.Session.create(
-        customer=sub["stripe_customer_id"],
-        return_url=settings.stripe_cancel_url,
-    )
-    return session.url
-
-
-# ── Webhook event handlers ─────────────────────────────────────────────────
-
-async def handle_checkout_completed(event_data: dict) -> None:
-    """Upgrade user to pro after successful checkout."""
-    session = event_data["object"]
-    user_id = session.get("metadata", {}).get("user_id")
-    subscription_id = session.get("subscription")
-    if not user_id or not subscription_id:
-        return
+async def create_subscription(user_id: str, email: str) -> dict:
+    """
+    Creates a Razorpay subscription for the pro plan.
+    Returns {subscription_id, key_id} for the frontend checkout modal.
+    Frontend uses these to open checkout.js with subscription_id instead of order_id.
+    """
+    customer_id = await get_or_create_razorpay_customer(user_id, email)
+    subscription = rz_client.subscription.create({
+        "plan_id": settings.razorpay_pro_plan_id,
+        "customer_notify": 1,
+        "total_count": 120,       # 10 years of monthly billing
+        "customer_id": customer_id,
+        "notes": {"user_id": user_id},
+    })
+    subscription_id = subscription["id"]
+    # Store pending subscription id so verify endpoint can match it
     await execute(
         """
         UPDATE public.subscriptions
-        SET plan_tier = 'pro',
-            status = 'active',
-            stripe_subscription_id = $2,
-            updated_at = now()
+        SET razorpay_subscription_id = $2, updated_at = now()
         WHERE user_id = $1::uuid
         """,
         user_id,
         subscription_id,
     )
+    return {
+        "subscription_id": subscription_id,
+        "key_id": settings.razorpay_key_id,   # safe to expose — public key only
+    }
 
 
-async def handle_invoice_paid(event_data: dict) -> None:
-    """Refresh current_period_end on renewal."""
-    invoice = event_data["object"]
-    customer_id = invoice.get("customer")
-    period_end = invoice.get("lines", {}).get("data", [{}])[0].get("period", {}).get("end")
-    if not customer_id or not period_end:
-        return
-    import datetime
-    period_end_dt = datetime.datetime.utcfromtimestamp(period_end).replace(tzinfo=datetime.timezone.utc)
+def verify_payment_signature(payment_id: str, subscription_id: str, signature: str) -> bool:
+    """
+    Verifies Razorpay HMAC-SHA256 signature for subscription payments.
+    Algorithm: HMAC-SHA256(payment_id + "|" + subscription_id, KEY_SECRET)
+    NOTE: Order payments use order_id + "|" + payment_id — subscriptions are reversed.
+    """
+    message = f"{payment_id}|{subscription_id}"
+    expected = hmac.new(
+        settings.razorpay_key_secret.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def activate_pro(user_id: str) -> None:
+    """Called after successful signature verification — upgrades user to pro."""
     await execute(
         """
         UPDATE public.subscriptions
-        SET status = 'active',
-            current_period_end = $2,
-            updated_at = now()
-        WHERE stripe_customer_id = $1
+        SET plan_tier = 'pro', status = 'active', updated_at = now()
+        WHERE user_id = $1::uuid
         """,
-        customer_id,
+        user_id,
+    )
+
+
+async def cancel_subscription(user_id: str) -> bool:
+    """
+    Cancels at period end. Returns False if no active subscription.
+    Razorpay has no customer portal — this endpoint replaces it.
+    """
+    sub = await get_subscription(user_id)
+    if not sub or not sub.get("razorpay_subscription_id"):
+        return False
+    rz_client.subscription.cancel(sub["razorpay_subscription_id"], {"cancel_at_cycle_end": 1})
+    return True
+
+
+# ── Webhook event handlers ─────────────────────────────────────────────────
+
+async def handle_subscription_charged(event_data: dict) -> None:
+    """Fired on each successful subscription renewal — refresh period_end."""
+    subscription = event_data.get("subscription", {})
+    subscription_id = subscription.get("id")
+    if not subscription_id:
+        return
+
+    import datetime
+    current_end = subscription.get("current_end")
+    period_end_dt = (
+        datetime.datetime.utcfromtimestamp(current_end).replace(tzinfo=datetime.timezone.utc)
+        if current_end else None
+    )
+    await execute(
+        """
+        UPDATE public.subscriptions
+        SET plan_tier = 'pro', status = 'active', current_period_end = $2, updated_at = now()
+        WHERE razorpay_subscription_id = $1
+        """,
+        subscription_id,
         period_end_dt,
     )
 
 
-async def handle_invoice_payment_failed(event_data: dict) -> None:
-    customer_id = event_data["object"].get("customer")
-    if not customer_id:
+async def handle_subscription_halted(event_data: dict) -> None:
+    """Fired when Razorpay halts subscription after repeated payment failures."""
+    subscription_id = event_data.get("subscription", {}).get("id")
+    if not subscription_id:
         return
     await execute(
-        """
-        UPDATE public.subscriptions
-        SET status = 'past_due', updated_at = now()
-        WHERE stripe_customer_id = $1
-        """,
-        customer_id,
+        "UPDATE public.subscriptions SET status = 'past_due', updated_at = now() WHERE razorpay_subscription_id = $1",
+        subscription_id,
     )
 
 
-async def handle_subscription_deleted(event_data: dict) -> None:
-    """Downgrade back to free when subscription is cancelled."""
-    subscription = event_data["object"]
-    customer_id = subscription.get("customer")
-    if not customer_id:
+async def handle_subscription_cancelled(event_data: dict) -> None:
+    """Downgrade to free when subscription is cancelled."""
+    subscription_id = event_data.get("subscription", {}).get("id")
+    if not subscription_id:
         return
     await execute(
         """
         UPDATE public.subscriptions
-        SET plan_tier = 'free',
-            status = 'active',
-            stripe_subscription_id = NULL,
-            current_period_end = NULL,
-            updated_at = now()
-        WHERE stripe_customer_id = $1
+        SET plan_tier = 'free', status = 'active',
+            razorpay_subscription_id = NULL, current_period_end = NULL, updated_at = now()
+        WHERE razorpay_subscription_id = $1
         """,
-        customer_id,
+        subscription_id,
     )
 ```
 
@@ -348,27 +356,32 @@ from modules.billing import (
     end_interview_session,
     get_subscription,
     get_free_usage,
-    create_checkout_session,
-    create_portal_session,
-    handle_checkout_completed,
-    handle_invoice_paid,
-    handle_invoice_payment_failed,
-    handle_subscription_deleted,
+    create_subscription,
+    verify_payment_signature,
+    activate_pro,
+    cancel_subscription,
+    handle_subscription_charged,
+    handle_subscription_halted,
+    handle_subscription_cancelled,
     FREE_SESSION_LIMIT,
 )
-import stripe as stripe_lib
+import razorpay as razorpay_lib
+from modules.config import settings
 ```
 
-### 5b. New Pydantic models — add after existing models
+### 5b. New Pydantic models
 
 ```python
 class EndSessionRequest(BaseModel):
     duration_seconds: int
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_payment_id: str
+    razorpay_subscription_id: str
+    razorpay_signature: str
 ```
 
-### 5c. Patch `POST /signup` — provision subscription after user creation
-
-Replace the current `/signup` handler body. After `response.user` is confirmed, add:
+### 5c. Patch `POST /signup`
 
 ```python
 @app.post("/signup")
@@ -385,13 +398,13 @@ async def signup(request: AuthRequest):
 
 ### 5d. Patch `_find_or_create_user` in `modules/auth_google.py`
 
-In the `_find_or_create_user` function, after a **new user is inserted** (not found), call `provision_free_subscription`. Add import at top of that file:
+Add import:
 
 ```python
 from modules.billing import provision_free_subscription
 ```
 
-After the INSERT block that creates `new_row`, add:
+After new user INSERT:
 
 ```python
 user_id_str = str(new_row["id"])
@@ -399,11 +412,7 @@ await provision_free_subscription(user_id_str)
 return {"id": user_id_str, "email": new_row["email"]}
 ```
 
-The existing-user branch (`if row:`) does NOT call provision — idempotency is handled by `ON CONFLICT DO NOTHING` in `provision_free_subscription` anyway, but we skip it for perf.
-
-### 5e. Patch `POST /interview/session` — add quota gate
-
-Find the existing `/interview/session` endpoint. Add quota check before creating the session:
+### 5e. Patch `POST /interview/session` — quota gate
 
 ```python
 @app.post("/interview/session")
@@ -411,7 +420,6 @@ async def start_interview_session(
     request: InterviewSessionRequest,
     user_id: str = Depends(require_user_id),
 ):
-    # Quota check
     quota = await check_can_start_session(user_id)
     if not quota["allowed"]:
         raise HTTPException(
@@ -433,14 +441,11 @@ async def start_interview_session(
     if not session_id:
         raise HTTPException(status_code=404, detail="Profile not found or does not belong to user")
 
-    # Increment free usage counter only for free-tier sessions
     if quota["reason"] == "free":
         await increment_free_sessions_used(user_id)
 
     return {"session_id": str(session_id)}
 ```
-
-Note: Check the exact current endpoint signature in `main.py` — the handler may currently use `authorization: str = Header(None)` pattern. Convert it to use `Depends(require_user_id)` for consistency if it doesn't already.
 
 ### 5f. Add `PATCH /interview/session/{session_id}/end`
 
@@ -482,81 +487,148 @@ async def subscription_status(user_id: str = Depends(require_user_id)):
     }
 ```
 
-### 5h. Add `POST /subscription/checkout`
+### 5h. Add `POST /payment/create-order`
 
-Requires user email — fetch from neon_auth.user:
+Creates a Razorpay subscription and returns credentials for the frontend checkout modal.
 
 ```python
-@app.post("/subscription/checkout")
-async def subscription_checkout(user_id: str = Depends(require_user_id)):
+@app.post("/payment/create-order")
+async def payment_create_order(user_id: str = Depends(require_user_id)):
     user_row = await fetch_one(
         'SELECT email FROM neon_auth."user" WHERE id = $1::uuid',
         user_id,
     )
     if not user_row:
         raise HTTPException(status_code=404, detail="User not found")
-    url = await create_checkout_session(user_id, user_row["email"])
-    return {"checkout_url": url}
+    data = await create_subscription(user_id, user_row["email"])
+    return data   # {subscription_id, key_id}
 ```
 
-Add `from modules.database import fetch_one` import if not already present.
+### 5i. Add `POST /payment/verify`
 
-### 5i. Add `POST /subscription/portal`
+Verifies HMAC signature after frontend checkout completes, then activates pro.
 
 ```python
-@app.post("/subscription/portal")
-async def subscription_portal(user_id: str = Depends(require_user_id)):
-    url = await create_portal_session(user_id)
-    if not url:
-        raise HTTPException(status_code=400, detail="No billing account found. Complete a checkout first.")
-    return {"portal_url": url}
+@app.post("/payment/verify")
+async def payment_verify(
+    body: VerifyPaymentRequest,
+    user_id: str = Depends(require_user_id),
+):
+    if not body.razorpay_payment_id or not body.razorpay_subscription_id or not body.razorpay_signature:
+        raise HTTPException(status_code=400, detail="Missing payment fields")
+
+    valid = verify_payment_signature(
+        body.razorpay_payment_id,
+        body.razorpay_subscription_id,
+        body.razorpay_signature,
+    )
+    if not valid:
+        raise HTTPException(status_code=400, detail="Signature mismatch — payment not verified")
+
+    await activate_pro(user_id)
+    return {"ok": True, "plan_tier": "pro"}
 ```
 
-### 5j. Add `POST /subscription/webhook` — NO AUTH, Stripe signature validation
+### 5j. Add `POST /subscription/cancel`
+
+```python
+@app.post("/subscription/cancel")
+async def subscription_cancel(user_id: str = Depends(require_user_id)):
+    cancelled = await cancel_subscription(user_id)
+    if not cancelled:
+        raise HTTPException(status_code=400, detail="No active subscription found.")
+    return {"ok": True, "message": "Subscription will cancel at end of current billing period."}
+```
+
+### 5k. Add `POST /subscription/webhook` — NO AUTH, Razorpay signature validation
 
 ```python
 @app.post("/subscription/webhook")
-async def stripe_webhook(request: Request):
+async def razorpay_webhook(request: Request):
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
+    sig_header = request.headers.get("x-razorpay-signature")
 
     try:
-        event = stripe_lib.Webhook.construct_event(
-            payload, sig_header, settings.stripe_webhook_secret
+        rz = razorpay_lib.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+        rz.utility.verify_webhook_signature(
+            payload.decode("utf-8"),
+            sig_header,
+            settings.razorpay_webhook_secret,
         )
-    except stripe_lib.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Razorpay signature")
 
-    event_type = event["type"]
-    event_data = event["data"]
+    import json
+    event = json.loads(payload)
+    event_type = event.get("event")
+    event_data = event.get("payload", {})
 
-    if event_type == "checkout.session.completed":
-        await handle_checkout_completed(event_data)
-    elif event_type == "invoice.paid":
-        await handle_invoice_paid(event_data)
-    elif event_type == "invoice.payment_failed":
-        await handle_invoice_payment_failed(event_data)
-    elif event_type == "customer.subscription.deleted":
-        await handle_subscription_deleted(event_data)
+    if event_type == "subscription.charged":
+        await handle_subscription_charged(event_data)
+    elif event_type == "subscription.halted":
+        await handle_subscription_halted(event_data)
+    elif event_type == "subscription.cancelled":
+        await handle_subscription_cancelled(event_data)
 
     return {"received": True}
 ```
 
 ---
 
-## Step 6 — Find existing `/interview/session` POST endpoint
+## Step 6 — Frontend Integration
 
-Search `app/main.py` for the existing `POST /interview/session` handler. It currently likely looks like:
+Frontend must include the Razorpay checkout script:
 
-```python
-@app.post("/interview/session")
-async def start_interview_session(..., authorization: str = Header(None)):
-    ...
-    session_id = await create_interview_session(...)
-    ...
+```html
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 ```
 
-Replace it entirely with the version in Step 5e above.
+On "Upgrade to Pro" click:
+
+```javascript
+// 1. Call backend to create subscription
+const { subscription_id, key_id } = await fetch("/payment/create-order", {
+  method: "POST",
+  headers: { Authorization: `Bearer ${token}` },
+}).then(r => r.json());
+
+// 2. Open Razorpay modal
+const rzp = new Razorpay({
+  key: key_id,
+  subscription_id: subscription_id,   // use subscription_id, NOT order_id
+  name: "Your App Name",
+  description: "Pro Plan",
+  handler: async function (response) {
+    // 3. Verify on backend
+    await fetch("/payment/verify", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        razorpay_payment_id: response.razorpay_payment_id,
+        razorpay_subscription_id: response.razorpay_subscription_id,
+        razorpay_signature: response.razorpay_signature,
+      }),
+    });
+    // 4. Refresh subscription status in UI
+  },
+  modal: {
+    ondismiss: () => { /* user cancelled — show message */ },
+  },
+  prefill: { email: userEmail },
+});
+rzp.on("payment.failed", (response) => { /* show error */ });
+rzp.open();
+```
+
+Environment variables for frontend (`key_id` only — never `key_secret`):
+- Next.js: `NEXT_PUBLIC_RAZORPAY_KEY_ID`
+- Vite: `VITE_RAZORPAY_KEY_ID`
+- CRA: `REACT_APP_RAZORPAY_KEY_ID`
+
+Alternatively, the backend returns `key_id` in the `/payment/create-order` response — no frontend env var needed.
 
 ---
 
@@ -564,12 +636,12 @@ Replace it entirely with the version in Step 5e above.
 
 | File | Change |
 |------|--------|
-| `migrations/add_free_usage_and_session_duration.sql` | CREATE free_usage, ALTER interview_sessions |
-| `requirements.txt` | Add `stripe>=8.0.0` |
-| `modules/config.py` | Add 5 Stripe env vars to Settings |
+| `migrations/add_razorpay_and_free_usage.sql` | Rename stripe→razorpay columns, CREATE free_usage, ALTER interview_sessions |
+| `requirements.txt` | Add `razorpay>=1.4.0` |
+| `modules/config.py` | Add 4 Razorpay env vars to Settings |
 | `modules/billing.py` | **NEW FILE** — all billing logic |
 | `modules/auth_google.py` | Call `provision_free_subscription` for new users |
-| `app/main.py` | Patch `/signup`, patch `/interview/session`, add 5 new endpoints |
+| `app/main.py` | Patch `/signup`, patch `/interview/session`, add 6 new endpoints |
 
 ---
 
@@ -577,31 +649,61 @@ Replace it entirely with the version in Step 5e above.
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
+| POST | `/payment/create-order` | Bearer | Creates Razorpay subscription, returns `{subscription_id, key_id}` |
+| POST | `/payment/verify` | Bearer | Verifies HMAC signature, activates pro |
 | GET | `/subscription/status` | Bearer | Plan, usage, remaining sessions |
-| POST | `/subscription/checkout` | Bearer | Returns Stripe checkout URL |
-| POST | `/subscription/portal` | Bearer | Returns Stripe billing portal URL |
-| POST | `/subscription/webhook` | None (Stripe sig) | Handles Stripe events |
+| POST | `/subscription/cancel` | Bearer | Cancels at period end |
+| POST | `/subscription/webhook` | None (Razorpay sig) | Handles Razorpay lifecycle events |
 | PATCH | `/interview/session/{id}/end` | Bearer | Stores session duration |
-| POST | `/interview/session` | Bearer | **Modified** — now checks quota, returns 402 if exceeded |
+| POST | `/interview/session` | Bearer | **Modified** — quota check, returns 402 if exceeded |
 
 ---
 
-## Stripe Webhook Events Handled
+## Razorpay Webhook Events Handled
 
 | Event | Action |
 |-------|--------|
-| `checkout.session.completed` | Set `plan_tier='pro'`, store `stripe_subscription_id` |
-| `invoice.paid` | Set `status='active'`, update `current_period_end` |
-| `invoice.payment_failed` | Set `status='past_due'` |
-| `customer.subscription.deleted` | Downgrade to `plan_tier='free'`, clear Stripe IDs |
+| `subscription.charged` | Set `plan_tier='pro'`, `status='active'`, update `current_period_end` |
+| `subscription.halted` | Set `status='past_due'` (too many payment failures) |
+| `subscription.cancelled` | Downgrade to `plan_tier='free'`, clear Razorpay IDs |
+
+---
+
+## Payment Flow (End-to-End)
+
+```
+User clicks "Upgrade"
+  → POST /payment/create-order      (backend creates Razorpay subscription, stores pending sub_id)
+  → Frontend opens checkout.js modal with subscription_id
+  → User pays
+  → Razorpay calls handler with {payment_id, subscription_id, signature}
+  → POST /payment/verify             (backend verifies HMAC, sets plan_tier='pro')
+  → UI shows Pro status
+
+On renewal (monthly):
+  → Razorpay fires subscription.charged webhook
+  → Backend refreshes current_period_end, keeps status='active'
+
+On failure:
+  → Razorpay fires subscription.halted after N retries
+  → Backend sets status='past_due'
+
+On cancellation:
+  → POST /subscription/cancel        (backend calls Razorpay cancel_at_cycle_end=1)
+  → Razorpay fires subscription.cancelled at period end
+  → Backend downgrades to plan_tier='free'
+```
 
 ---
 
 ## Notes for Agent
 
-1. Do NOT run migrations automatically — output the SQL and tell user to run it in Neon console or via psql.
-2. The `subscriptions` table already exists — do NOT recreate it. Only run 1b and 1c migrations.
-3. `user_id` in `neon_auth."user"` is UUID type but asyncpg returns it as `asyncpg.pgproto.UUID` — always cast with `$1::uuid` in queries targeting that table. For `free_usage.user_id` (TEXT), no cast needed.
-4. The webhook endpoint must be excluded from any auth middleware — it uses Stripe signature validation instead.
-5. `stripe_lib.Webhook.construct_event` is synchronous — no `await` needed.
-6. Test quota logic: create user → confirm `subscriptions` + `free_usage` rows auto-created → start 3 sessions → 4th call must return 402.
+1. Do NOT run migrations automatically — output SQL and tell user to run in Neon console.
+2. `subscriptions` table already exists — only run 1a (rename), 1b, 1c.
+3. `user_id` in `neon_auth."user"` is UUID — always cast `$1::uuid`. For `free_usage.user_id` (TEXT), no cast.
+4. `/subscription/webhook` must be excluded from auth middleware — uses Razorpay signature instead.
+5. `verify_webhook_signature()` is synchronous — no `await`.
+6. Signature algorithm differs: subscriptions use `payment_id + "|" + subscription_id` (not `order_id + "|" + payment_id` which is for one-time orders).
+7. Test credentials in `.env`: `RAZORPAY_KEY_ID=rzp_test_SkpUjWU3TfWOeT` / `RAZORPAY_KEY_SECRET=UPCYaNnQdAw7QdTtXar1zIV8`. Replace with `rzp_live_...` for production.
+8. Razorpay plans must be pre-created in the Razorpay dashboard — `RAZORPAY_PRO_PLAN_ID` must match a real plan ID.
+9. Test quota: create user → 3 sessions → 4th returns 402. Test payment: use Razorpay test card `4111 1111 1111 1111`.

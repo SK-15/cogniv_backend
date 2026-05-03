@@ -9,6 +9,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from modules.config import settings
 from modules.database import fetch_one, execute
+from modules.billing import provision_free_subscription
 
 router = APIRouter()
 
@@ -102,7 +103,9 @@ async def _find_or_create_user(email: str, name: str) -> dict:
         ''',
         name, email,
     )
-    return {"id": str(new_row["id"]), "email": new_row["email"]}
+    user_id_str = str(new_row["id"])
+    await provision_free_subscription(user_id_str)
+    return {"id": user_id_str, "email": new_row["email"]}
 
 
 @router.get("/auth/google/start")

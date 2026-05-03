@@ -34,6 +34,24 @@ from modules.interview import (
     get_session_prompt_context,
 )
 from modules.launch_signup import insert_launch_signup
+from modules.database import fetch_one
+from modules.billing import (
+    provision_free_subscription,
+    check_can_start_session,
+    increment_free_sessions_used,
+    end_interview_session,
+    get_subscription,
+    get_free_usage,
+    create_subscription,
+    verify_payment_signature,
+    activate_pro,
+    cancel_subscription,
+    handle_subscription_charged,
+    handle_subscription_halted,
+    handle_subscription_cancelled,
+    FREE_SESSION_LIMIT,
+)
+import razorpay as razorpay_lib
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +151,14 @@ class LaunchSignupRequest(BaseModel):
     profession: str
 
 
+class EndSessionRequest(BaseModel):
+    duration_seconds: int
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_payment_id: str
+    razorpay_subscription_id: str
+    razorpay_signature: str
+
 class AIAnswerRequest(BaseModel):
     session_id: str
     question: Optional[str] = None
@@ -152,6 +178,7 @@ async def signup(request: AuthRequest):
     try:
         response = await sign_up_user(request.email, request.password)
         if response.user:
+            await provision_free_subscription(response.user.id)
             return {"message": "User created successfully", "user_id": response.user.id}
         raise HTTPException(status_code=400, detail="Signup failed")
     except Exception as e:
@@ -592,6 +619,18 @@ async def start_interview_session(
     body: InterviewSessionRequest,
     user_id: str = Depends(require_user_id),
 ):
+    quota = await check_can_start_session(user_id)
+    if not quota["allowed"]:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "free_quota_exceeded",
+                "message": "Free sessions exhausted. Upgrade to Pro for unlimited sessions.",
+                "sessions_used": FREE_SESSION_LIMIT,
+                "sessions_remaining": 0,
+            },
+        )
+
     try:
         profile_uuid = UUID(body.profile_id)
     except ValueError:
@@ -605,7 +644,109 @@ async def start_interview_session(
     )
     if not session_id:
         raise HTTPException(status_code=404, detail="Profile not found")
+
+    if quota["reason"] == "free":
+        await increment_free_sessions_used(user_id)
+
     return {"session_id": str(session_id)}
+
+
+@app.patch("/interview/session/{session_id}/end")
+async def end_session(
+    session_id: str,
+    body: EndSessionRequest,
+    user_id: str = Depends(require_user_id),
+):
+    if body.duration_seconds < 0:
+        raise HTTPException(status_code=422, detail="duration_seconds must be >= 0")
+    updated = await end_interview_session(user_id, session_id, body.duration_seconds)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Session not found, already ended, or not owned by user")
+    return {"ok": True, "duration_seconds": body.duration_seconds}
+
+
+@app.get("/subscription/status")
+async def subscription_status(user_id: str = Depends(require_user_id)):
+    sub = await get_subscription(user_id)
+    usage = await get_free_usage(user_id)
+    plan = sub["plan_tier"] if sub else "free"
+    status = sub["status"] if sub else "active"
+    sessions_used = usage["sessions_used"] if usage else 0
+    sessions_remaining = max(0, FREE_SESSION_LIMIT - sessions_used) if plan == "free" else None
+    return {
+        "plan_tier": plan,
+        "status": status,
+        "sessions_used": sessions_used if plan == "free" else None,
+        "sessions_remaining": sessions_remaining,
+        "free_session_limit": FREE_SESSION_LIMIT if plan == "free" else None,
+        "current_period_end": sub["current_period_end"].isoformat() if sub and sub.get("current_period_end") else None,
+    }
+
+
+@app.post("/payment/create-order")
+async def payment_create_order(user_id: str = Depends(require_user_id)):
+    user_row = await fetch_one(
+        'SELECT email FROM neon_auth."user" WHERE id = $1::uuid',
+        user_id,
+    )
+    if not user_row:
+        raise HTTPException(status_code=404, detail="User not found")
+    data = await create_subscription(user_id, user_row["email"])
+    return data  # {subscription_id, key_id}
+
+
+@app.post("/payment/verify")
+async def payment_verify(
+    body: VerifyPaymentRequest,
+    user_id: str = Depends(require_user_id),
+):
+    if not body.razorpay_payment_id or not body.razorpay_subscription_id or not body.razorpay_signature:
+        raise HTTPException(status_code=400, detail="Missing payment fields")
+    valid = verify_payment_signature(
+        body.razorpay_payment_id,
+        body.razorpay_subscription_id,
+        body.razorpay_signature,
+    )
+    if not valid:
+        raise HTTPException(status_code=400, detail="Signature mismatch — payment not verified")
+    await activate_pro(user_id)
+    return {"ok": True, "plan_tier": "pro"}
+
+
+@app.post("/subscription/cancel")
+async def subscription_cancel(user_id: str = Depends(require_user_id)):
+    cancelled = await cancel_subscription(user_id)
+    if not cancelled:
+        raise HTTPException(status_code=400, detail="No active subscription found.")
+    return {"ok": True, "message": "Subscription will cancel at end of current billing period."}
+
+
+@app.post("/subscription/webhook")
+async def razorpay_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("x-razorpay-signature")
+    try:
+        rz = razorpay_lib.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
+        rz.utility.verify_webhook_signature(
+            payload.decode("utf-8"),
+            sig_header,
+            settings.razorpay_webhook_secret,
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Razorpay signature")
+
+    event = json.loads(payload)
+    event_type = event.get("event")
+    event_data = event.get("payload", {})
+
+    if event_type == "subscription.charged":
+        await handle_subscription_charged(event_data)
+    elif event_type == "subscription.halted":
+        await handle_subscription_halted(event_data)
+    elif event_type == "subscription.cancelled":
+        await handle_subscription_cancelled(event_data)
+
+    return {"received": True}
 
 
 @app.post("/analyse-screen")

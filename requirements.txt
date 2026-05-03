@@ -17,3 +17,4 @@ pymupdf
 python-docx
 httpx
 itsdangerous
+razorpay>=1.4.0
