@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = ""
+    google_redirect_uri_web: str = ""
     app_secret_key: str = ""
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""

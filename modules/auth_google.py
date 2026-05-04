@@ -108,6 +108,87 @@ async def _find_or_create_user(email: str, name: str) -> dict:
     return {"id": user_id_str, "email": new_row["email"]}
 
 
+@router.get("/auth/google/start/web")
+def google_start_web():
+    state = _signer.dumps({"nonce": "cogniv-oauth", "source": "web"})
+    params = {
+        "client_id":     settings.google_client_id,
+        "redirect_uri":  settings.google_redirect_uri_web,
+        "response_type": "code",
+        "scope":         "openid email profile",
+        "access_type":   "offline",
+        "prompt":        "select_account",
+        "state":         state,
+    }
+    url = GOOGLE_AUTH_URL + "?" + urllib.parse.urlencode(params)
+    return RedirectResponse(url, status_code=302)
+
+
+@router.get("/auth/google/callback/web")
+async def google_callback_web(
+    code: str = None,
+    state: str = None,
+    error: str = None,
+):
+    WEB_FRONTEND_CALLBACK = "https://cogniv.co.in/auth/callback"
+
+    def _error_redirect(msg: str) -> RedirectResponse:
+        params = urllib.parse.urlencode({"error": msg})
+        return RedirectResponse(f"{WEB_FRONTEND_CALLBACK}?{params}", status_code=302)
+
+    if state:
+        try:
+            _signer.loads(state, max_age=600)
+        except (BadSignature, SignatureExpired):
+            return _error_redirect("invalid_state")
+
+    if error:
+        return _error_redirect(error)
+    if not code or not state:
+        return _error_redirect("missing_code_or_state")
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(GOOGLE_TOKEN_URL, data={
+            "code":          code,
+            "client_id":     settings.google_client_id,
+            "client_secret": settings.google_client_secret,
+            "redirect_uri":  settings.google_redirect_uri_web,
+            "grant_type":    "authorization_code",
+        })
+    if token_resp.status_code != 200:
+        return _error_redirect("token_exchange_failed")
+
+    google_tokens = token_resp.json()
+    google_access_token = google_tokens.get("access_token")
+    if not google_access_token:
+        return _error_redirect("no_access_token")
+
+    async with httpx.AsyncClient() as client:
+        profile_resp = await client.get(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {google_access_token}"},
+        )
+    if profile_resp.status_code != 200:
+        return _error_redirect("profile_fetch_failed")
+
+    profile = profile_resp.json()
+    email = profile.get("email")
+    name  = profile.get("name", "")
+    if not email:
+        return _error_redirect("no_email_from_google")
+
+    user = await _find_or_create_user(email=email, name=name)
+    access_token  = _mint_access_token(user["id"], user["email"])
+    refresh_token = google_tokens.get("refresh_token", "")
+
+    params = urllib.parse.urlencode({
+        "access_token":  access_token,
+        "refresh_token": refresh_token,
+        "user_id":       user["id"],
+    })
+    return RedirectResponse(f"{WEB_FRONTEND_CALLBACK}?{params}", status_code=302)
+
+
 @router.get("/auth/google/start")
 def google_start(local_port: int = Query(..., description="Loopback port the Electron app is listening on")):
     """
