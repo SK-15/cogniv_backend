@@ -3,7 +3,8 @@
 This API provides authentication via Supabase and streaming chat responses from OpenAI and Gemini.
 
 ## Base URL
-`http://localhost:8000`
+- **Production**: `https://adcrkz336r.ap-south-1.awsapprunner.com`
+- **Local**: `http://localhost:8000`
 
 ## Authentication
 Most endpoints are public, but the `/chat` endpoint requires a valid Supabase access token passed in the `Authorization` header.
@@ -497,7 +498,212 @@ Return the server-side Gemini API key for client-side use.
     *   **Code**: 401 Unauthorized
     *   **Code**: 503 Service Unavailable (key not configured in .env)
 
-### 20. Live Audio Transcription (WebSocket)
+### 20. End Interview Session
+Mark a session as ended and store its duration.
+
+*   **URL**: `/interview/session/{session_id}/end`
+*   **Method**: `PATCH`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+    *   `Content-Type: application/json`
+*   **Request Body**:
+    ```json
+    {
+      "duration_seconds": 420
+    }
+    ```
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "ok": true,
+          "duration_seconds": 420
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 404 Not Found (session not found, already ended, or not owned by user)
+    *   **Code**: 422 Unprocessable Entity (`duration_seconds` < 0)
+
+---
+
+### 21. Google OAuth — Start (Electron)
+Redirect to Google's consent screen. For use by the Electron desktop app only.
+
+*   **URL**: `/auth/google/start`
+*   **Method**: `GET`
+*   **Query Parameters**:
+    *   `local_port`: **Required**. Loopback port the Electron app is listening on.
+*   **Success Response**:
+    *   **Code**: 302 Redirect → Google OAuth consent URL
+
+---
+
+### 22. Google OAuth — Callback (Electron)
+Receives the OAuth code from Google, exchanges it, and redirects to the Electron loopback server.
+
+*   **URL**: `/auth/google/callback`
+*   **Method**: `GET`
+*   **Query Parameters** (set by Google):
+    *   `code`, `state`, `error`
+*   **Success Response**:
+    *   **Code**: 302 Redirect → `http://127.0.0.1:{local_port}/callback?access_token=...&refresh_token=...&user_id=...`
+*   **Error Response**:
+    *   **Code**: 302 Redirect → `http://127.0.0.1:{local_port}/callback?error=<message>`
+
+---
+
+### 23. Google OAuth — Start (Web)
+Redirect to Google's consent screen. For use by the web app at cogniv.co.in.
+
+*   **URL**: `/auth/google/start/web`
+*   **Method**: `GET`
+*   **Success Response**:
+    *   **Code**: 302 Redirect → Google OAuth consent URL
+
+---
+
+### 24. Google OAuth — Callback (Web)
+Receives the OAuth code from Google, exchanges it, and redirects back to the web frontend with tokens.
+
+*   **URL**: `/auth/google/callback/web`
+*   **Method**: `GET`
+*   **Query Parameters** (set by Google):
+    *   `code`, `state`, `error`
+*   **Success Response**:
+    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback?access_token=...&refresh_token=...&user_id=...`
+*   **Error Response**:
+    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback?error=<message>`
+
+---
+
+### 25. Subscription Status
+Return the authenticated user's current plan, usage, and session quota.
+
+*   **URL**: `/subscription/status`
+*   **Method**: `GET`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "plan_tier": "free",
+          "status": "active",
+          "sessions_used": 2,
+          "sessions_remaining": 1,
+          "free_session_limit": 3,
+          "current_period_end": null
+        }
+        ```
+        *   `plan_tier`: `"free"` or `"pro"`
+        *   `status`: `"active"`, `"cancelled"`, or `"past_due"`
+        *   `sessions_used`, `sessions_remaining`, `free_session_limit`: `null` when on Pro plan
+        *   `current_period_end`: ISO timestamp or `null` (Pro only)
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+
+---
+
+### 26. Create Payment Order
+Create a Razorpay subscription and return credentials to open the checkout modal.
+
+*   **URL**: `/payment/create-order`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "subscription_id": "sub_...",
+          "key_id": "rzp_..."
+        }
+        ```
+        Pass `subscription_id` to `Razorpay({ subscription_id })` on the frontend. Never hardcode `key_id`.
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 404 Not Found (user not found)
+
+---
+
+### 27. Verify Payment
+Verify Razorpay payment signature after checkout modal success and activate Pro plan.
+
+*   **URL**: `/payment/verify`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+    *   `Content-Type: application/json`
+*   **Request Body**:
+    ```json
+    {
+      "razorpay_payment_id": "pay_...",
+      "razorpay_subscription_id": "sub_...",
+      "razorpay_signature": "signature-string"
+    }
+    ```
+    All three fields come from the Razorpay checkout `handler` callback.
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "ok": true,
+          "plan_tier": "pro"
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 400 Bad Request (signature mismatch)
+    *   **Code**: 401 Unauthorized
+
+---
+
+### 28. Cancel Subscription
+Cancel the active Pro subscription at the end of the current billing period.
+
+*   **URL**: `/subscription/cancel`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>`
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "ok": true,
+          "message": "Subscription will cancel at end of current billing period."
+        }
+        ```
+*   **Error Response**:
+    *   **Code**: 400 Bad Request (no active subscription found)
+    *   **Code**: 401 Unauthorized
+
+---
+
+### 29. Razorpay Webhook
+Receives Razorpay subscription lifecycle events. No auth — validated by Razorpay HMAC signature header.
+
+*   **URL**: `/subscription/webhook`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `x-razorpay-signature`: Razorpay HMAC-SHA256 signature over the raw body
+*   **Events handled**:
+    *   `subscription.charged` → sets `plan_tier='pro'`, updates `current_period_end`
+    *   `subscription.halted` → sets `status='past_due'`
+    *   `subscription.cancelled` → downgrades to `plan_tier='free'`
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**: `{ "received": true }`
+*   **Error Response**:
+    *   **Code**: 400 Bad Request (invalid signature)
+
+---
+
+### 30. Live Audio Transcription (WebSocket)
 Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
 
 *   **URL**: `/listen`
@@ -659,6 +865,45 @@ curl -X POST "http://localhost:8000/ai-answer" \
      -H "Content-Type: application/json" \
      -d '{"session_id":"<SESSION_UUID>","question":"Summarize STAR method","provider":"openai"}' \
      --no-buffer
+```
+
+### End interview session
+```bash
+curl -X PATCH "http://localhost:8000/interview/session/<SESSION_UUID>/end" \
+     -H "Authorization: Bearer <TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{"duration_seconds": 420}'
+```
+
+### Google OAuth — start (web, opens in browser)
+```bash
+open "http://localhost:8000/auth/google/start/web"
+```
+
+### Subscription status
+```bash
+curl -X GET "http://localhost:8000/subscription/status" \
+     -H "Authorization: Bearer <TOKEN>"
+```
+
+### Create payment order
+```bash
+curl -X POST "http://localhost:8000/payment/create-order" \
+     -H "Authorization: Bearer <TOKEN>"
+```
+
+### Verify payment
+```bash
+curl -X POST "http://localhost:8000/payment/verify" \
+     -H "Authorization: Bearer <TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{"razorpay_payment_id":"pay_...","razorpay_subscription_id":"sub_...","razorpay_signature":"..."}'
+```
+
+### Cancel subscription
+```bash
+curl -X POST "http://localhost:8000/subscription/cancel" \
+     -H "Authorization: Bearer <TOKEN>"
 ```
 
 ---

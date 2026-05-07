@@ -18,3 +18,4 @@ python-docx
 httpx
 itsdangerous
 razorpay>=1.4.0
+slowapi>=0.1.9

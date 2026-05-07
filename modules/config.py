@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     google_redirect_uri: str = ""
     google_redirect_uri_web: str = ""
     app_secret_key: str = ""
+    cors_origins: str = "https://cogniv.co.in"
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""

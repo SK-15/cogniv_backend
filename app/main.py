@@ -2,10 +2,14 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from typing import Optional
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
 from modules.config import settings
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 import asyncio
 import json
@@ -59,15 +63,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="Supabase LLM Chatbot API")
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+_cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 app.include_router(google_router)
 
@@ -174,29 +191,38 @@ class AIAnswerRequest(BaseModel):
         return q
 
 @app.post("/signup")
-async def signup(request: AuthRequest):
+@limiter.limit("5/minute")
+async def signup(request: Request, body: AuthRequest):
     try:
-        response = await sign_up_user(request.email, request.password)
+        response = await sign_up_user(body.email, body.password)
         if response.user:
             await provision_free_subscription(response.user.id)
             return {"message": "User created successfully", "user_id": response.user.id}
-        raise HTTPException(status_code=400, detail="Signup failed")
+        raise HTTPException(status_code=400, detail="signup_failed")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        err = str(e).lower()
+        if "already" in err or "duplicate" in err or "exists" in err or "taken" in err:
+            raise HTTPException(status_code=409, detail="email_taken")
+        raise HTTPException(status_code=400, detail="signup_failed")
 
 @app.post("/login")
-async def login(request: AuthRequest):
+@limiter.limit("10/minute")
+async def login(request: Request, body: AuthRequest):
     try:
-        response = await login_user(request.email, request.password)
+        response = await login_user(body.email, body.password)
         if response.session:
             return {
                 "access_token": response.session.access_token,
                 "refresh_token": response.session.refresh_token,
                 "user_id": response.user.id,
             }
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(status_code=401, detail="invalid_credentials")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="invalid_credentials")
 
 
 @app.post("/refresh")
@@ -684,7 +710,8 @@ async def subscription_status(user_id: str = Depends(require_user_id)):
 
 
 @app.post("/payment/create-order")
-async def payment_create_order(user_id: str = Depends(require_user_id)):
+@limiter.limit("10/minute")
+async def payment_create_order(request: Request, user_id: str = Depends(require_user_id)):
     user_row = await fetch_one(
         'SELECT email FROM neon_auth."user" WHERE id = $1::uuid',
         user_id,

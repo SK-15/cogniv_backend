@@ -181,12 +181,12 @@ async def google_callback_web(
     access_token  = _mint_access_token(user["id"], user["email"])
     refresh_token = google_tokens.get("refresh_token", "")
 
-    params = urllib.parse.urlencode({
+    fragment = urllib.parse.urlencode({
         "access_token":  access_token,
         "refresh_token": refresh_token,
         "user_id":       user["id"],
     })
-    return RedirectResponse(f"{WEB_FRONTEND_CALLBACK}?{params}", status_code=302)
+    return RedirectResponse(f"{WEB_FRONTEND_CALLBACK}#{fragment}", status_code=302)
 
 
 @router.get("/auth/google/start")
