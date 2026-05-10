@@ -46,16 +46,12 @@ from modules.billing import (
     end_interview_session,
     get_subscription,
     get_free_usage,
-    create_subscription,
+    create_order,
     verify_payment_signature,
-    activate_pro,
-    cancel_subscription,
-    handle_subscription_charged,
-    handle_subscription_halted,
-    handle_subscription_cancelled,
+    credit_sessions,
     FREE_SESSION_LIMIT,
+    PLAN_CONFIG,
 )
-import razorpay as razorpay_lib
 
 logging.basicConfig(
     level=logging.INFO,
@@ -171,10 +167,14 @@ class LaunchSignupRequest(BaseModel):
 class EndSessionRequest(BaseModel):
     duration_seconds: int
 
+class CreateOrderRequest(BaseModel):
+    plan_id: str
+
 class VerifyPaymentRequest(BaseModel):
     razorpay_payment_id: str
-    razorpay_subscription_id: str
+    razorpay_order_id: str
     razorpay_signature: str
+    plan_id: str
 
 class AIAnswerRequest(BaseModel):
     session_id: str
@@ -695,31 +695,28 @@ async def end_session(
 async def subscription_status(user_id: str = Depends(require_user_id)):
     sub = await get_subscription(user_id)
     usage = await get_free_usage(user_id)
-    plan = sub["plan_tier"] if sub else "free"
-    status = sub["status"] if sub else "active"
     sessions_used = usage["sessions_used"] if usage else 0
-    sessions_remaining = max(0, FREE_SESSION_LIMIT - sessions_used) if plan == "free" else None
+    sessions_purchased = sub["sessions_purchased"] if sub else 0
+    total_limit = FREE_SESSION_LIMIT + sessions_purchased
+    sessions_remaining = max(0, total_limit - sessions_used)
     return {
-        "plan_tier": plan,
-        "status": status,
-        "sessions_used": sessions_used if plan == "free" else None,
+        "sessions_used": sessions_used,
+        "sessions_purchased": sessions_purchased,
         "sessions_remaining": sessions_remaining,
-        "free_session_limit": FREE_SESSION_LIMIT if plan == "free" else None,
-        "current_period_end": sub["current_period_end"].isoformat() if sub and sub.get("current_period_end") else None,
+        "free_session_limit": FREE_SESSION_LIMIT,
     }
 
 
 @app.post("/payment/create-order")
 @limiter.limit("10/minute")
-async def payment_create_order(request: Request, user_id: str = Depends(require_user_id)):
-    user_row = await fetch_one(
-        'SELECT email FROM neon_auth."user" WHERE id = $1::uuid',
-        user_id,
-    )
-    if not user_row:
-        raise HTTPException(status_code=404, detail="User not found")
-    data = await create_subscription(user_id, user_row["email"])
-    return data  # {subscription_id, key_id}
+async def payment_create_order(body: CreateOrderRequest, request: Request, user_id: str = Depends(require_user_id)):
+    if body.plan_id not in PLAN_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan_id}")
+    try:
+        data = await create_order(body.plan_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Razorpay error: {e}")
+    return data  # {order_id, amount, currency, key_id}
 
 
 @app.post("/payment/verify")
@@ -727,53 +724,19 @@ async def payment_verify(
     body: VerifyPaymentRequest,
     user_id: str = Depends(require_user_id),
 ):
-    if not body.razorpay_payment_id or not body.razorpay_subscription_id or not body.razorpay_signature:
-        raise HTTPException(status_code=400, detail="Missing payment fields")
+    if body.plan_id not in PLAN_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan_id}")
     valid = verify_payment_signature(
+        body.razorpay_order_id,
         body.razorpay_payment_id,
-        body.razorpay_subscription_id,
         body.razorpay_signature,
     )
     if not valid:
         raise HTTPException(status_code=400, detail="Signature mismatch — payment not verified")
-    await activate_pro(user_id)
-    return {"ok": True, "plan_tier": "pro"}
-
-
-@app.post("/subscription/cancel")
-async def subscription_cancel(user_id: str = Depends(require_user_id)):
-    cancelled = await cancel_subscription(user_id)
-    if not cancelled:
-        raise HTTPException(status_code=400, detail="No active subscription found.")
-    return {"ok": True, "message": "Subscription will cancel at end of current billing period."}
-
-
-@app.post("/subscription/webhook")
-async def razorpay_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("x-razorpay-signature")
-    try:
-        rz = razorpay_lib.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
-        rz.utility.verify_webhook_signature(
-            payload.decode("utf-8"),
-            sig_header,
-            settings.razorpay_webhook_secret,
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid Razorpay signature")
-
-    event = json.loads(payload)
-    event_type = event.get("event")
-    event_data = event.get("payload", {})
-
-    if event_type == "subscription.charged":
-        await handle_subscription_charged(event_data)
-    elif event_type == "subscription.halted":
-        await handle_subscription_halted(event_data)
-    elif event_type == "subscription.cancelled":
-        await handle_subscription_cancelled(event_data)
-
-    return {"received": True}
+    await provision_free_subscription(user_id)
+    await credit_sessions(user_id, body.plan_id)
+    sessions = PLAN_CONFIG[body.plan_id]["sessions"]
+    return {"ok": True, "sessions_credited": sessions}
 
 
 @app.post("/analyse-screen")

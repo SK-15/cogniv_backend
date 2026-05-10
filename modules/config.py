@@ -18,8 +18,6 @@ class Settings(BaseSettings):
     cors_origins: str = "https://cogniv.co.in"
     razorpay_key_id: str = ""
     razorpay_key_secret: str = ""
-    razorpay_webhook_secret: str = ""
-    razorpay_pro_plan_id: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
