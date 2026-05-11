@@ -133,6 +133,7 @@ async def create_order(plan_id: str) -> dict:
         "amount": plan["amount"],
         "currency": "INR",
         "receipt": f"rcpt_{plan_id}_{int(time.time())}",
+        "notes": {"plan_id": plan_id},
     })
     return {
         "order_id": order["id"],
@@ -156,11 +157,14 @@ async def credit_sessions(user_id: str, plan_id: str, order_id: str, payment_id:
     plan = PLAN_CONFIG.get(plan_id)
     if not plan:
         raise ValueError(f"Unknown plan: {plan_id}")
-    await execute(
+
+    # Insert purchase record — returns the new row id, or nothing on conflict
+    row = await fetch_one(
         """
         INSERT INTO public.purchases (user_id, plan_id, sessions, amount, order_id, payment_id)
         VALUES ($1::uuid, $2, $3, $4, $5, $6)
         ON CONFLICT (order_id) DO NOTHING
+        RETURNING id
         """,
         user_id,
         plan_id,
@@ -169,6 +173,11 @@ async def credit_sessions(user_id: str, plan_id: str, order_id: str, payment_id:
         order_id,
         payment_id,
     )
+
+    if row is None:
+        # Duplicate order_id — already credited, skip silently
+        return
+
     result = await execute(
         """
         UPDATE public.subscriptions

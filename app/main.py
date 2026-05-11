@@ -52,6 +52,7 @@ from modules.billing import (
     get_subscription,
     increment_free_sessions_used,
     provision_free_subscription,
+    rz_client,
     verify_payment_signature,
 )
 
@@ -757,6 +758,19 @@ async def payment_verify(
     )
     if not valid:
         raise HTTPException(status_code=400, detail="Signature mismatch — payment not verified")
+    # Verify plan_id matches the order to prevent plan forgery
+    try:
+        order = rz_client.order.fetch(body.razorpay_order_id)
+        server_plan_id = order.get("notes", {}).get("plan_id")
+        if server_plan_id and server_plan_id != body.plan_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Plan mismatch — payment was for a different plan",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # If Razorpay fetch fails, proceed (signature already verified)
     await provision_free_subscription(user_id)
     await credit_sessions(user_id, body.plan_id, body.razorpay_order_id, body.razorpay_payment_id)
     sessions = PLAN_CONFIG[body.plan_id]["sessions"]
