@@ -18,6 +18,13 @@ PLAN_CONFIG = {
 PLAN_TIER_RANK = {"free": 0, "starter": 1, "pro": 2}
 
 
+def _compute_remaining(sub: dict | None, usage: dict | None) -> int:
+    """Compute remaining sessions from subscription and usage data."""
+    sessions_used = usage["sessions_used"] if usage else 0
+    sessions_purchased = sub["sessions_purchased"] if sub else 0
+    return max(0, FREE_SESSION_LIMIT + sessions_purchased - sessions_used)
+
+
 def _gate_purchase(sessions_remaining: int, current_tier: str, requested_plan: str) -> None:
     """Pure logic — raises HTTPException if purchase not allowed. Testable without DB."""
     if sessions_remaining > 0:
@@ -34,9 +41,7 @@ async def check_can_purchase(user_id: str, plan_id: str) -> None:
     """Async wrapper — fetches live state then calls _gate_purchase."""
     sub = await get_subscription(user_id)
     usage = await get_free_usage(user_id)
-    sessions_used = usage["sessions_used"] if usage else 0
-    sessions_purchased = sub["sessions_purchased"] if sub else 0
-    remaining = max(0, FREE_SESSION_LIMIT + sessions_purchased - sessions_used)
+    remaining = _compute_remaining(sub, usage)
     current_tier = sub["plan_tier"] if sub else "free"
     _gate_purchase(remaining, current_tier, plan_id)
 
@@ -87,10 +92,7 @@ async def check_can_start_session(user_id: str) -> dict:
         sub = await get_subscription(user_id)
 
     usage = await get_free_usage(user_id)
-    sessions_used = usage["sessions_used"] if usage else 0
-    sessions_purchased = sub["sessions_purchased"] if sub else 0
-    total_limit = FREE_SESSION_LIMIT + sessions_purchased
-    remaining = total_limit - sessions_used
+    remaining = _compute_remaining(sub, usage)
 
     if remaining > 0:
         return {"allowed": True, "reason": "credits", "sessions_remaining": remaining}

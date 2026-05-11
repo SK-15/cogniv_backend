@@ -2,7 +2,7 @@
 Unit tests for purchase gate logic.
 Run: cd /home/saurav/Projects/chatbot/backend && .venv/bin/python test_cases/test_billing_gate.py
 """
-import sys, os, asyncio
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PASS = "\033[92mPASS\033[0m"
