@@ -172,11 +172,15 @@ async def credit_sessions(user_id: str, plan_id: str, order_id: str, payment_id:
     await execute(
         """
         UPDATE public.subscriptions
-        SET sessions_purchased = sessions_purchased + $2, updated_at = now()
+        SET sessions_purchased  = sessions_purchased + $2,
+            plan_tier           = $3,
+            current_period_end  = now() AT TIME ZONE 'UTC' + INTERVAL '30 days',
+            updated_at          = now()
         WHERE user_id = $1::uuid
         """,
         user_id,
         plan["sessions"],
+        plan_id,
     )
 
 

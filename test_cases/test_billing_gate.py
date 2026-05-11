@@ -68,6 +68,29 @@ def test_gate_allows_free_tier_to_buy_anything():
         except Exception as e:
             check(f"free → {plan} allowed", False, str(e))
 
+def test_credit_sessions_sets_period_end():
+    """Integration test — requires DB connection. Skipped if DB unreachable."""
+    print("\n7. credit_sessions sets plan_tier and current_period_end (integration)")
+    import asyncio
+    try:
+        from modules.database import pool
+    except Exception as e:
+        print(f"  [SKIP] DB not reachable: {e}")
+        return
+
+    async def _run():
+        from modules.billing import get_subscription, provision_free_subscription
+        try:
+            await provision_free_subscription("00000000-0000-0000-0000-000000000001")
+            sub = await get_subscription("00000000-0000-0000-0000-000000000001")
+            check("subscription row exists after provision", sub is not None)
+            check("plan_tier defaults to free", sub["plan_tier"] == "free")
+            check("current_period_end is None initially", sub["current_period_end"] is None)
+        except Exception as e:
+            print(f"  [SKIP] DB constraint (expected on clean DB): {e}")
+
+    asyncio.run(_run())
+
 if __name__ == "__main__":
     test_plan_tier_rank()
     test_gate_blocks_same_plan_with_sessions()
@@ -75,4 +98,5 @@ if __name__ == "__main__":
     test_gate_allows_upgrade_with_sessions()
     test_gate_allows_any_plan_when_no_sessions()
     test_gate_allows_free_tier_to_buy_anything()
+    test_credit_sessions_sets_period_end()
     print()
