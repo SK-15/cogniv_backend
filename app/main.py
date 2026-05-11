@@ -40,18 +40,19 @@ from modules.interview import (
 from modules.launch_signup import insert_launch_signup
 from modules.database import fetch_one
 from modules.billing import (
-    provision_free_subscription,
-    check_can_start_session,
-    increment_free_sessions_used,
-    end_interview_session,
-    get_subscription,
-    get_free_usage,
-    create_order,
-    verify_payment_signature,
-    credit_sessions,
-    get_purchases,
     FREE_SESSION_LIMIT,
     PLAN_CONFIG,
+    check_can_purchase,
+    check_can_start_session,
+    create_order,
+    credit_sessions,
+    end_interview_session,
+    get_free_usage,
+    get_purchases,
+    get_subscription,
+    increment_free_sessions_used,
+    provision_free_subscription,
+    verify_payment_signature,
 )
 
 logging.basicConfig(
@@ -700,11 +701,14 @@ async def subscription_status(user_id: str = Depends(require_user_id)):
     sessions_purchased = sub["sessions_purchased"] if sub else 0
     total_limit = FREE_SESSION_LIMIT + sessions_purchased
     sessions_remaining = max(0, total_limit - sessions_used)
+    period_end = sub["current_period_end"] if sub else None
     return {
         "sessions_used": sessions_used,
         "sessions_purchased": sessions_purchased,
         "sessions_remaining": sessions_remaining,
         "free_session_limit": FREE_SESSION_LIMIT,
+        "plan_tier": sub["plan_tier"] if sub else "free",
+        "current_period_end": period_end.isoformat() if period_end else None,
     }
 
 
@@ -731,6 +735,7 @@ async def subscription_purchases(user_id: str = Depends(require_user_id)):
 async def payment_create_order(body: CreateOrderRequest, request: Request, user_id: str = Depends(require_user_id)):
     if body.plan_id not in PLAN_CONFIG:
         raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan_id}")
+    await check_can_purchase(user_id, body.plan_id)
     try:
         data = await create_order(body.plan_id)
     except Exception as e:
