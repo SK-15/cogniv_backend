@@ -73,21 +73,29 @@ def test_credit_sessions_sets_period_end():
     print("\n7. credit_sessions sets plan_tier and current_period_end (integration)")
     import asyncio
     try:
-        from modules.database import pool
+        from modules.database import get_pool  # noqa: F401 — confirms module is importable
     except Exception as e:
-        print(f"  [SKIP] DB not reachable: {e}")
+        print(f"  [SKIP] DB module not importable: {e}")
         return
 
     async def _run():
-        from modules.billing import get_subscription, provision_free_subscription
+        from modules.billing import get_subscription, provision_free_subscription, credit_sessions
+        TEST_USER = "00000000-0000-0000-0000-000000000001"
         try:
-            await provision_free_subscription("00000000-0000-0000-0000-000000000001")
-            sub = await get_subscription("00000000-0000-0000-0000-000000000001")
-            check("subscription row exists after provision", sub is not None)
-            check("plan_tier defaults to free", sub["plan_tier"] == "free")
-            check("current_period_end is None initially", sub["current_period_end"] is None)
+            # Provision so the subscription row exists
+            await provision_free_subscription(TEST_USER)
+
+            # Call credit_sessions with a unique fake order/payment to avoid ON CONFLICT skip
+            import time
+            fake_order = f"order_test_{int(time.time())}"
+            fake_payment = f"pay_test_{int(time.time())}"
+            await credit_sessions(TEST_USER, "starter", fake_order, fake_payment)
+
+            sub = await get_subscription(TEST_USER)
+            check("plan_tier set to starter after purchase", sub["plan_tier"] == "starter")
+            check("current_period_end is not None after purchase", sub["current_period_end"] is not None)
         except Exception as e:
-            print(f"  [SKIP] DB constraint (expected on clean DB): {e}")
+            print(f"  [SKIP] DB error (expected if test DB unavailable): {e}")
 
     asyncio.run(_run())
 

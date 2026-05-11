@@ -169,7 +169,7 @@ async def credit_sessions(user_id: str, plan_id: str, order_id: str, payment_id:
         order_id,
         payment_id,
     )
-    await execute(
+    result = await execute(
         """
         UPDATE public.subscriptions
         SET sessions_purchased  = sessions_purchased + $2,
@@ -182,6 +182,8 @@ async def credit_sessions(user_id: str, plan_id: str, order_id: str, payment_id:
         plan["sessions"],
         plan_id,
     )
+    if result == "UPDATE 0":
+        raise RuntimeError(f"No subscription row for user {user_id}; credits not applied")
 
 
 async def get_purchases(user_id: str) -> list[dict]:
