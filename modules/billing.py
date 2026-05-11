@@ -2,6 +2,7 @@ import time
 import hmac
 import hashlib
 import razorpay
+from fastapi import HTTPException
 from modules.config import settings
 from modules.database import fetch_one, fetch_all, execute
 
@@ -13,6 +14,31 @@ PLAN_CONFIG = {
     "starter": {"amount": 79900,  "sessions": 7},
     "pro":     {"amount": 149900, "sessions": 14},
 }
+
+PLAN_TIER_RANK = {"free": 0, "starter": 1, "pro": 2}
+
+
+def _gate_purchase(sessions_remaining: int, current_tier: str, requested_plan: str) -> None:
+    """Pure logic — raises HTTPException if purchase not allowed. Testable without DB."""
+    if sessions_remaining > 0:
+        current_rank = PLAN_TIER_RANK.get(current_tier, 0)
+        requested_rank = PLAN_TIER_RANK.get(requested_plan, 0)
+        if requested_rank <= current_rank:
+            raise HTTPException(
+                status_code=409,
+                detail="You still have active sessions. Upgrade to a higher plan or wait until sessions run out.",
+            )
+
+
+async def check_can_purchase(user_id: str, plan_id: str) -> None:
+    """Async wrapper — fetches live state then calls _gate_purchase."""
+    sub = await get_subscription(user_id)
+    usage = await get_free_usage(user_id)
+    sessions_used = usage["sessions_used"] if usage else 0
+    sessions_purchased = sub["sessions_purchased"] if sub else 0
+    remaining = max(0, FREE_SESSION_LIMIT + sessions_purchased - sessions_used)
+    current_tier = sub["plan_tier"] if sub else "free"
+    _gate_purchase(remaining, current_tier, plan_id)
 
 
 # ── Subscription provisioning ──────────────────────────────────────────────
