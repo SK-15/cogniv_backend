@@ -49,6 +49,7 @@ from modules.billing import (
     create_order,
     verify_payment_signature,
     credit_sessions,
+    get_purchases,
     FREE_SESSION_LIMIT,
     PLAN_CONFIG,
 )
@@ -707,6 +708,24 @@ async def subscription_status(user_id: str = Depends(require_user_id)):
     }
 
 
+@app.get("/subscription/purchases")
+async def subscription_purchases(user_id: str = Depends(require_user_id)):
+    rows = await get_purchases(user_id)
+    return {
+        "purchases": [
+            {
+                "plan_id":    r["plan_id"],
+                "sessions":   r["sessions"],
+                "amount_inr": r["amount"] / 100,
+                "order_id":   r["order_id"],
+                "payment_id": r["payment_id"],
+                "purchased_at": r["created_at"].isoformat(),
+            }
+            for r in rows
+        ]
+    }
+
+
 @app.post("/payment/create-order")
 @limiter.limit("10/minute")
 async def payment_create_order(body: CreateOrderRequest, request: Request, user_id: str = Depends(require_user_id)):
@@ -734,7 +753,7 @@ async def payment_verify(
     if not valid:
         raise HTTPException(status_code=400, detail="Signature mismatch — payment not verified")
     await provision_free_subscription(user_id)
-    await credit_sessions(user_id, body.plan_id)
+    await credit_sessions(user_id, body.plan_id, body.razorpay_order_id, body.razorpay_payment_id)
     sessions = PLAN_CONFIG[body.plan_id]["sessions"]
     return {"ok": True, "sessions_credited": sessions}
 

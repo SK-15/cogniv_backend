@@ -3,7 +3,7 @@ import hmac
 import hashlib
 import razorpay
 from modules.config import settings
-from modules.database import fetch_one, execute
+from modules.database import fetch_one, fetch_all, execute
 
 rz_client = razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
 
@@ -124,10 +124,23 @@ def verify_payment_signature(order_id: str, payment_id: str, signature: str) -> 
     return hmac.compare_digest(expected, signature)
 
 
-async def credit_sessions(user_id: str, plan_id: str) -> None:
+async def credit_sessions(user_id: str, plan_id: str, order_id: str, payment_id: str) -> None:
     plan = PLAN_CONFIG.get(plan_id)
     if not plan:
         raise ValueError(f"Unknown plan: {plan_id}")
+    await execute(
+        """
+        INSERT INTO public.purchases (user_id, plan_id, sessions, amount, order_id, payment_id)
+        VALUES ($1::uuid, $2, $3, $4, $5, $6)
+        ON CONFLICT (order_id) DO NOTHING
+        """,
+        user_id,
+        plan_id,
+        plan["sessions"],
+        plan["amount"],
+        order_id,
+        payment_id,
+    )
     await execute(
         """
         UPDATE public.subscriptions
@@ -136,4 +149,16 @@ async def credit_sessions(user_id: str, plan_id: str) -> None:
         """,
         user_id,
         plan["sessions"],
+    )
+
+
+async def get_purchases(user_id: str) -> list[dict]:
+    return await fetch_all(
+        """
+        SELECT plan_id, sessions, amount, order_id, payment_id, created_at
+        FROM public.purchases
+        WHERE user_id = $1::uuid
+        ORDER BY created_at DESC
+        """,
+        user_id,
     )
