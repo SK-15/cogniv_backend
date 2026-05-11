@@ -31,7 +31,8 @@ def check(label, cond, detail=""):
 
 def test_signature():
     print("\n1. Signature verification (local)")
-    key_secret = "UPCYaNnQdAw7QdTtXar1zIV8"
+    from modules.config import settings
+    key_secret = settings.razorpay_key_secret
     payment_id = "pay_test123"
     subscription_id = "sub_test456"
     message = f"{payment_id}|{subscription_id}"
