@@ -2,7 +2,6 @@ from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 from typing import Optional
 from deepgram import DeepgramClient
@@ -22,12 +21,8 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row, refresh_neon_auth_session
 from modules.auth_google import router as google_router, refresh_google_oauth_tokens
-from modules.chat import get_user_threads, get_thread_chats, create_thread, save_chat_message, delete_thread
-from modules.llm import stream_openai, stream_gemini, needs_diagram_hint, DIAGRAM_SYSTEM_ADDENDUM, _openai_client
-from modules.agent import agent_stream
-from modules.websearch import web_search_task
-from modules.storage import upload_to_supabase
-from modules.ocr import extract_structured_text, extract_text
+from modules.llm import stream_openai, stream_gemini, _openai_client
+from modules.ocr import extract_text
 from modules.resume_text import extract_resume_text, ResumeTextExtractionError
 from modules.interview import (
     get_interview_profiles,
@@ -119,10 +114,6 @@ async def warm_llm():
         pass
 
 
-UPLOADS_DIR = Path(__file__).resolve().parent.parent / "uploads"
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
-
 ALLOWED_RESUME_SUFFIXES = {".pdf", ".docx"}
 
 
@@ -156,21 +147,6 @@ class RefreshTokenRequest(BaseModel):
         None,
         description="`neon`, `google`, or omit for `auto` (try Neon Auth, then Google).",
     )
-
-class ChatRequest(BaseModel):
-    prompt: str
-    thread_id: str
-    provider: str = "openai"  # "openai" or "gemini"
-
-class NewChatRequest(BaseModel):
-    title: str = "New Chat"
-
-class WebSearchRequest(BaseModel):
-    query: str
-
-class OCRRequest(BaseModel):
-    provider: str = "gemini"
-    prompt: Optional[str] = None
 
 class InterviewSessionRequest(BaseModel):
     profile_id: str
@@ -334,254 +310,6 @@ async def launch_signup(request: LaunchSignupRequest):
         "profession": row["profession"],
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
     }
-
-
-@app.post("/new_chat")
-async def new_chat(request: NewChatRequest, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    token = authorization.split(" ")[1]
-    try:
-        user_res = await get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Invalid session")
-        
-        thread = await create_thread(user_res.user.id, request.title)
-        if not thread:
-            raise HTTPException(status_code=500, detail="Failed to create thread")
-            
-        return thread
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/chat")
-async def chat(request: ChatRequest, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    token = authorization.split(" ")[1]
-    try:
-        # Verify user with Supabase
-        user_res = await get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_res.user.id
-    except Exception:
-        raise HTTPException(status_code=401, detail="Authentication failed")
-
-    # Fetch chat history
-    history = await get_thread_chats(user_id, request.thread_id)
-
-    system_prompt = DIAGRAM_SYSTEM_ADDENDUM if needs_diagram_hint(request.prompt) else None
-
-    async def generate_and_save():
-        full_response = ""
-        try:
-            async for chunk in agent_stream(
-                prompt=request.prompt,
-                history=history,
-                model=request.provider,
-                system_prompt=system_prompt,
-            ):
-                full_response += chunk
-                yield chunk
-        except Exception as e:
-            print(f"Stream error: {e}")
-        finally:
-            if full_response:
-                asyncio.create_task(save_chat_message(user_id, request.thread_id, request.prompt, full_response))
-
-    return StreamingResponse(generate_and_save(), media_type="text/event-stream")
-
-@app.post("/upload")
-async def upload_file(
-    request: Request,
-    thread_id: str,
-    file: UploadFile = File(...),
-    authorization: str = Header(None)
-):
-    logger.info(f"[/upload] Request received — filename: '{file.filename}', content_type: '{file.content_type}', thread_id: '{thread_id}'")
-
-    if not authorization or not authorization.startswith("Bearer "):
-        logger.warning("[/upload] Missing or invalid Authorization header")
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-
-    token = authorization.split(" ")[1]
-    logger.info("[/upload] Token extracted, verifying user...")
-
-    try:
-        user_res = await get_user(token)
-        if not user_res.user:
-            logger.warning("[/upload] get_user returned no user — invalid session")
-            raise HTTPException(status_code=401, detail="Invalid session")
-        user_id = user_res.user.id
-        logger.info(f"[/upload] Authenticated user_id: {user_id}")
-
-        # Upload to Supabase Storage
-        logger.info(f"[/upload] Calling upload_to_supabase for '{file.filename}'...")
-        public_url = await upload_to_supabase(file, base_url=str(request.base_url))
-        logger.info(f"[/upload] upload_to_supabase returned: {public_url}")
-
-        if not public_url:
-            logger.error("[/upload] upload_to_supabase returned None — raising 500")
-            raise HTTPException(status_code=500, detail="Failed to upload file")
-
-        # Parse file content (assuming text/markdown/code for now)
-        # We need to reset the file cursor because upload_to_supabase read it
-        logger.info("[/upload] Seeking file back to 0 and re-reading content...")
-        await file.seek(0)
-        content = await file.read()
-        logger.info(f"[/upload] Re-read {len(content)} bytes from file")
-
-        try:
-            text_content = content.decode("utf-8")
-            logger.info(f"[/upload] File decoded as UTF-8, length: {len(text_content)} chars")
-        except UnicodeDecodeError:
-            # If binary, just use the URL
-            logger.info("[/upload] File is binary — using URL reference as text content")
-            text_content = f"I have uploaded a file: {file.filename}. Access it here: {public_url}"
-        else:
-            # If text, include a snippet or full content
-            text_content = f"I have uploaded a file '{file.filename}'.\n\nContent:\n{text_content}"
-
-        ai_acknowledgement = f"Received file: {file.filename}."
-
-        logger.info(f"[/upload] Saving chat message for user_id={user_id}, thread_id={thread_id}...")
-        try:
-            save_success = await save_chat_message(user_id, thread_id, text_content, ai_acknowledgement)
-            if save_success:
-                logger.info("[/upload] Chat message saved successfully")
-            else:
-                logger.error("[/upload] save_chat_message returned False — check database logs or thread_id validity")
-        except Exception as db_err:
-            logger.error(f"[/upload] Failed to save chat message to database: {db_err}", exc_info=True)
-
-        logger.info(f"[/upload] Upload complete. Returning URL: {public_url}")
-        return {"message": "File uploaded and processed", "url": public_url}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[/upload] Unexpected exception: {type(e).__name__}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/threads")
-async def get_threads(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    token = authorization.split(" ")[1]
-    try:
-        user_res = await get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Invalid session")
-        
-        user_id = user_res.user.id
-        threads = await get_user_threads(user_id)
-        return {"threads": threads}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/threads/{thread_id}/chats")
-async def get_chats(thread_id: str, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    token = authorization.split(" ")[1]
-    try:
-        user_res = await get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Invalid session")
-        
-        user_id = user_res.user.id
-        # In a real app we might verify thread ownership here or rely on RLS
-        chats = await get_thread_chats(user_id, thread_id)
-        return {"chats": chats}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/threads/{thread_id}")
-async def delete_thread_endpoint(thread_id: str, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    token = authorization.split(" ")[1]
-    try:
-        user_res = await get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Invalid session")
-        
-        user_id = user_res.user.id
-        success = await delete_thread(user_id, thread_id)
-        
-        if not success:
-            raise HTTPException(status_code=404, detail="Thread not found or could not be deleted")
-            
-        return {"message": "Thread deleted successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/websearch")
-async def websearch(request: WebSearchRequest, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    token = authorization.split(" ")[1]
-    try:
-        user_res = await get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Invalid session")
-        
-        # Perform web search
-        answer = await web_search_task(request.query)
-        return {"answer": answer}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/ocr")
-async def ocr_endpoint(
-    file: UploadFile = File(...),
-    provider: str = "gemini",
-    prompt: Optional[str] = None,
-    authorization: str = Header(None)
-):
-    """
-    Perform OCR on an uploaded image and return structured text as JSON.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-    
-    token = authorization.split(" ")[1]
-    try:
-        user_res = await get_user(token)
-        if not user_res.user:
-            raise HTTPException(status_code=401, detail="Invalid session")
-            
-        # Read image bytes
-        image_bytes = await file.read()
-        mime_type = file.content_type or "image/jpeg"
-        
-        # Extract structured text
-        structured_data = await extract_structured_text(
-            image_bytes=image_bytes,
-            mime_type=mime_type,
-            provider=provider,
-            prompt=prompt
-        )
-        
-        if structured_data is None:
-            raise HTTPException(status_code=500, detail="OCR extraction failed")
-            
-        return structured_data
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"OCR endpoint error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/save_profile")
