@@ -6,6 +6,34 @@ This API provides authentication via Supabase and streaming chat responses from 
 - **Production**: `https://adcrkz336r.ap-south-1.awsapprunner.com`
 - **Local**: `http://localhost:8000`
 
+## Security
+
+### CORS
+Only `https://cogniv.co.in` is allowed by default. Configurable via `CORS_ORIGINS` env var (comma-separated for multiple origins, e.g. local dev).
+
+### Rate Limiting
+Applied per IP address. Returns `429 Too Many Requests` with `Retry-After` header on breach.
+
+| Endpoint | Limit |
+|----------|-------|
+| `POST /login` | 10 req/min |
+| `POST /signup` | 5 req/min |
+| `POST /payment/create-order` | 10 req/min |
+
+### Security Headers
+All responses include:
+```
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+```
+
+### Error Normalization
+Auth endpoints return opaque error codes — no internal details or user enumeration signals leaked:
+- `/login` always returns `"invalid_credentials"` on 401 (wrong email OR wrong password)
+- `/signup` returns `"email_taken"` (409) or `"signup_failed"` (400)
+
+---
+
 ## Authentication
 Most endpoints are public, but the `/chat` endpoint requires a valid Supabase access token passed in the `Authorization` header.
 
@@ -21,6 +49,7 @@ Create a new user account in Supabase.
 
 *   **URL**: `/signup`
 *   **Method**: `POST`
+*   **Rate limit**: 5 requests/minute per IP
 *   **Request Body**:
     ```json
     {
@@ -37,14 +66,17 @@ Create a new user account in Supabase.
           "user_id": "uuid-string"
         }
         ```
-*   **Error Response**:
-    *   **Code**: 400 Bad Request (if email is invalid or signup fails)
+*   **Error Responses**:
+    *   **Code**: 400 `{"detail": "signup_failed"}` (invalid email or other error)
+    *   **Code**: 409 `{"detail": "email_taken"}` (email already registered)
+    *   **Code**: 429 Too Many Requests (rate limit exceeded)
 
 ### 2. User Login
 Authenticate a user and receive access tokens.
 
 *   **URL**: `/login`
 *   **Method**: `POST`
+*   **Rate limit**: 10 requests/minute per IP
 *   **Request Body**:
     ```json
     {
@@ -63,8 +95,9 @@ Authenticate a user and receive access tokens.
         }
         ```
         `refresh_token` is always present; it may be `null` if the identity provider did not return a refresh token.
-*   **Error Response**:
-    *   **Code**: 401 Unauthorized (invalid credentials)
+*   **Error Responses**:
+    *   **Code**: 401 `{"detail": "invalid_credentials"}` (wrong email or password — intentionally indistinct)
+    *   **Code**: 429 Too Many Requests (rate limit exceeded)
 
 ### 3. Refresh session tokens
 Exchange a **refresh token** for new `access_token` / `refresh_token` values. Neon Auth (email/password) and the app’s Google OAuth (Electron loopback) use different refresh tokens; set `provider` or use the default `auto` behavior.
@@ -572,9 +605,11 @@ Receives the OAuth code from Google, exchanges it, and redirects back to the web
 *   **Query Parameters** (set by Google):
     *   `code`, `state`, `error`
 *   **Success Response**:
-    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback?access_token=...&refresh_token=...&user_id=...`
+    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback#access_token=...&refresh_token=...&user_id=...`
+    *   Tokens are in the **URL fragment** (`#`), not query params — fragments are never sent to servers or logged.
+    *   Frontend reads via `new URLSearchParams(window.location.hash.slice(1))`
 *   **Error Response**:
-    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback?error=<message>`
+    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback?error=<message>` (errors via query param, not fragment)
 
 ---
 
@@ -612,6 +647,7 @@ Create a Razorpay subscription and return credentials to open the checkout modal
 
 *   **URL**: `/payment/create-order`
 *   **Method**: `POST`
+*   **Rate limit**: 10 requests/minute per IP
 *   **Headers**:
     *   `Authorization: Bearer <access_token>`
 *   **Success Response**:
@@ -627,6 +663,7 @@ Create a Razorpay subscription and return credentials to open the checkout modal
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
     *   **Code**: 404 Not Found (user not found)
+    *   **Code**: 429 Too Many Requests (rate limit exceeded)
 
 ---
 
