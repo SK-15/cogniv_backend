@@ -212,7 +212,7 @@ async def login(request: Request, body: AuthRequest):
         if response.session:
             return {
                 "access_token": response.session.access_token,
-                "refresh_token": response.session.refresh_token,
+                "refresh_token": response.session.refresh_token or response.session.access_token,
                 "user_id": response.user.id,
             }
         raise HTTPException(status_code=401, detail="invalid_credentials")
