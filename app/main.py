@@ -19,8 +19,9 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
-from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row, refresh_neon_auth_session
+from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row
 from modules.auth_google import router as google_router, refresh_google_oauth_tokens
+from modules.app_tokens import mint_access_token, issue_refresh_token, rotate_refresh_token, revoke_refresh_token
 from modules.llm import stream_openai, stream_gemini, _openai_client
 from modules.ocr import extract_text
 from modules.resume_text import extract_resume_text, ResumeTextExtractionError
@@ -209,13 +210,17 @@ async def signup(request: Request, body: AuthRequest):
 async def login(request: Request, body: AuthRequest):
     try:
         response = await login_user(body.email, body.password)
-        if response.session:
-            return {
-                "access_token": response.session.access_token,
-                "refresh_token": response.session.refresh_token or response.session.access_token,
-                "user_id": response.user.id,
-            }
-        raise HTTPException(status_code=401, detail="invalid_credentials")
+        if not response.user:
+            raise HTTPException(status_code=401, detail="invalid_credentials")
+
+        user_id = response.user.id
+        access_token = mint_access_token(user_id, body.email)
+        refresh_token = await issue_refresh_token(user_id)
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user_id": user_id,
+        }
     except HTTPException:
         raise
     except Exception:
@@ -225,52 +230,55 @@ async def login(request: Request, body: AuthRequest):
 @app.post("/refresh")
 async def refresh_session(body: RefreshTokenRequest):
     """
-    Obtain new access (and possibly refresh) tokens using a refresh token.
-    Neon Auth (email/password) and Google OAuth (Electron loopback) use different refresh tokens;
-    pass `provider` or leave `auto` to try Neon Auth first, then Google.
+    Exchange a refresh token for a new access/refresh token pair.
+
+    Primary path: app-issued opaque refresh tokens (rotated on every use).
+    Legacy fallback: Google OAuth refresh tokens issued before the unified
+    token system; on success the client is migrated to an app refresh token.
     """
     rt = (body.refresh_token or "").strip()
     if not rt:
         raise HTTPException(status_code=422, detail="refresh_token is required")
 
-    mode = (body.provider or "auto").strip().lower()
-    if mode not in ("auto", "neon", "google"):
-        raise HTTPException(
-            status_code=422,
-            detail="provider must be 'auto', 'neon', or 'google'",
-        )
-
-    if mode == "google":
-        out = await refresh_google_oauth_tokens(rt)
-        if not out:
-            raise HTTPException(status_code=401, detail="Refresh failed")
-        return {**out, "provider": "google"}
-
-    if mode == "neon":
-        response = await refresh_neon_auth_session(rt)
-        if not response or not response.session or not response.user:
-            raise HTTPException(status_code=401, detail="Refresh failed")
+    rotated = await rotate_refresh_token(rt)
+    if rotated:
+        user_id, new_refresh = rotated
+        email = ""
+        row = await get_auth_user_row(user_id)
+        if row:
+            email = row.get("email") or ""
         return {
-            "access_token": response.session.access_token,
-            "refresh_token": response.session.refresh_token,
-            "user_id": response.user.id,
-            "provider": "neon",
+            "access_token": mint_access_token(user_id, email),
+            "refresh_token": new_refresh,
+            "user_id": user_id,
         }
 
-    response = await refresh_neon_auth_session(rt)
-    if response and response.session and response.user:
-        return {
-            "access_token": response.session.access_token,
-            "refresh_token": response.session.refresh_token,
-            "user_id": response.user.id,
-            "provider": "neon",
-        }
-
+    # Legacy Google refresh token: validate, then migrate to an app refresh token.
     out = await refresh_google_oauth_tokens(rt)
     if out:
-        return {**out, "provider": "google"}
+        new_refresh = await issue_refresh_token(out["user_id"])
+        return {
+            "access_token": out["access_token"],
+            "refresh_token": new_refresh,
+            "user_id": out["user_id"],
+        }
 
     raise HTTPException(status_code=401, detail="Refresh failed")
+
+
+@app.post("/logout")
+async def logout(body: RefreshTokenRequest):
+    """
+    Revoke a refresh token so it can no longer be used to mint new sessions.
+
+    Always returns 200 (idempotent): logging out an unknown or already-revoked
+    token is a no-op. Existing access tokens remain valid until they expire (1h).
+    """
+    rt = (body.refresh_token or "").strip()
+    if not rt:
+        raise HTTPException(status_code=422, detail="refresh_token is required")
+    await revoke_refresh_token(rt)
+    return {"message": "logged_out"}
 
 
 @app.get("/deepgram/api_key")

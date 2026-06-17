@@ -1,8 +1,6 @@
 import urllib.parse
-import datetime
 
 import httpx
-import jwt
 from fastapi import APIRouter, Query
 from fastapi.responses import RedirectResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -10,14 +8,13 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from modules.config import settings
 from modules.database import fetch_one, execute
 from modules.billing import provision_free_subscription
+from modules.app_tokens import mint_access_token, issue_refresh_token
 
 router = APIRouter()
 
 GOOGLE_AUTH_URL     = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL    = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
-JWT_ALGORITHM       = "HS256"
-ACCESS_TOKEN_EXPIRE = datetime.timedelta(hours=1)
 
 _signer = URLSafeTimedSerializer(settings.app_secret_key or "fallback-key")
 
@@ -65,25 +62,12 @@ async def refresh_google_oauth_tokens(refresh_token: str) -> dict | None:
         return None
 
     user = await _find_or_create_user(email=email, name=name)
-    access_token = _mint_access_token(user["id"], user["email"])
-    new_refresh = google_tokens.get("refresh_token") or refresh_token
+    access_token = mint_access_token(user["id"], user["email"])
 
     return {
         "access_token": access_token,
-        "refresh_token": new_refresh,
         "user_id": user["id"],
     }
-
-
-def _mint_access_token(user_id: str, email: str) -> str:
-    now = datetime.datetime.utcnow()
-    payload = {
-        "sub":   user_id,
-        "email": email,
-        "iat":   now,
-        "exp":   now + ACCESS_TOKEN_EXPIRE,
-    }
-    return jwt.encode(payload, settings.app_secret_key, algorithm=JWT_ALGORITHM)
 
 
 async def _find_or_create_user(email: str, name: str) -> dict:
@@ -178,8 +162,8 @@ async def google_callback_web(
         return _error_redirect("no_email_from_google")
 
     user = await _find_or_create_user(email=email, name=name)
-    access_token  = _mint_access_token(user["id"], user["email"])
-    refresh_token = google_tokens.get("refresh_token", "")
+    access_token  = mint_access_token(user["id"], user["email"])
+    refresh_token = await issue_refresh_token(user["id"])
 
     fragment = urllib.parse.urlencode({
         "access_token":  access_token,
@@ -280,8 +264,8 @@ async def google_callback(
     user = await _find_or_create_user(email=email, name=name)
 
     # 6. Mint a JWT access token compatible with require_user_id (HS256)
-    access_token  = _mint_access_token(user["id"], user["email"])
-    refresh_token = google_tokens.get("refresh_token", "")
+    access_token  = mint_access_token(user["id"], user["email"])
+    refresh_token = await issue_refresh_token(user["id"])
 
     # 7. Redirect to the Electron loopback server
     params = urllib.parse.urlencode({
