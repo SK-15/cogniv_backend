@@ -297,3 +297,19 @@ async def get_auth_user_row(user_id: str) -> dict | None:
         return dict(row) if row else None
     except Exception:
         return None
+
+
+async def get_user_role(user_id: str) -> str | None:
+    """
+    Return the neon_auth user's role (e.g. 'admin'), or None if missing/error.
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT role FROM neon_auth."user" WHERE id = $1::uuid',
+                user_id,
+            )
+        return row["role"] if row else None
+    except Exception:
+        return None

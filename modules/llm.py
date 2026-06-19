@@ -1,12 +1,16 @@
 import openai
 from google import genai
 from google.genai import types
+import anthropic
 from modules.config import settings
 
 openai.api_key = settings.openai_api_key
 
 _openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
 _gemini_client = genai.Client(api_key=settings.gemini_api_key)
+_anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"
 
 DIAGRAM_KEYWORDS = {"flow", "diagram", "sequence", "architecture", "visualize", "chart", "graph", "steps", "flowchart"}
 
@@ -62,6 +66,39 @@ async def stream_gemini(prompt: str, history: list = None, system_prompt: str | 
     ):
         if chunk.text:
             yield chunk.text
+
+
+async def stream_anthropic(prompt: str, history: list = None, system_prompt: str | None = None):
+    messages = []
+    if history:
+        for chat in history:
+            messages.append({"role": "user", "content": chat["query"]})
+            messages.append({"role": "assistant", "content": chat["response"]})
+    messages.append({"role": "user", "content": prompt})
+
+    kwargs = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 4096,
+        "messages": messages,
+    }
+    if system_prompt:
+        kwargs["system"] = system_prompt
+
+    async with _anthropic_client.messages.stream(**kwargs) as stream:
+        async for text in stream.text_stream:
+            if text:
+                yield text
+
+
+def select_stream(provider: str):
+    """Return the streaming generator function for the given provider."""
+    p = (provider or "").lower()
+    if p == "gemini":
+        return stream_gemini
+    if p in ("anthropic", "claude"):
+        return stream_anthropic
+    return stream_openai
+
 
 
 async def generate_response(prompt: str, model_type: str = "openai", history: list = None):

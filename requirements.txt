@@ -7,6 +7,7 @@ python-dotenv
 pydantic-settings
 openai
 google-genai
+anthropic
 python-multipart
 ddgs
 beautifulsoup4

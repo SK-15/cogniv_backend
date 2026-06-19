@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     # Accepts both GEMINI_API_KEY and GENAI_API_KEY from the environment
     gemini_api_key: str = Field(default="", validation_alias=AliasChoices("GEMINI_API_KEY", "GENAI_API_KEY"))
+    # Accepts both ANTHROPIC_API_KEY and CLAUDE_API_KEY from the environment
+    anthropic_api_key: str = Field(default="", validation_alias=AliasChoices("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"))
     deepgram_api_key: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""

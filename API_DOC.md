@@ -465,7 +465,7 @@ Extract raw text from an uploaded image, then **stream** an LLM answer for any q
     *   `Authorization: Bearer <access_token>`
     *   `Content-Type: multipart/form-data`
 *   **Query Parameters**:
-    *   `provider`: Optional. LLM for OCR and answering. `"openai"` (default) or `"gemini"`.
+    *   `provider`: Optional. LLM for OCR and answering. `"openai"` (default), `"gemini"`, or `"anthropic"` (Claude).
 *   **Request Body** (form fields):
     *   `file`: The image file to analyze.
     *   `session_id`: **Required**. UUID of an `interview_sessions` row owned by the user.

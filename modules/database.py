@@ -22,7 +22,7 @@ async def get_pool() -> asyncpg.Pool:
     if pool is None:
         pool = await asyncpg.create_pool(
             dsn=settings.neon_database_url,
-            min_size=1,
+            min_size=2,
             max_size=10,
         )
         _pools[key] = pool

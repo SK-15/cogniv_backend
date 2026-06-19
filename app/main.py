@@ -19,10 +19,10 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
-from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row
+from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row, get_user_role
 from modules.auth_google import router as google_router, refresh_google_oauth_tokens
 from modules.app_tokens import mint_access_token, issue_refresh_token, rotate_refresh_token, revoke_refresh_token
-from modules.llm import stream_openai, stream_gemini, _openai_client
+from modules.llm import stream_openai, stream_gemini, select_stream, _openai_client
 from modules.ocr import extract_text
 from modules.resume_text import extract_resume_text, ResumeTextExtractionError
 from modules.interview import (
@@ -35,10 +35,11 @@ from modules.interview import (
     get_session_prompt_context,
 )
 from modules.launch_signup import insert_launch_signup
-from modules.database import fetch_one
+from modules.database import fetch_one, get_pool
 from modules.billing import (
     FREE_SESSION_LIMIT,
     PLAN_CONFIG,
+    adjust_user_sessions,
     check_can_purchase,
     check_can_start_session,
     create_order,
@@ -104,13 +105,20 @@ app.include_router(google_router)
 
 @app.on_event("startup")
 async def warm_llm():
-    """Pre-establish OpenAI connection pool to eliminate first-request latency."""
+    """Pre-establish OpenAI + DB connection pools to eliminate first-request latency."""
     try:
         await _openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=1,
         )
+    except Exception:
+        pass
+    try:
+        # Open the asyncpg pool now so the first real request doesn't pay for it.
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1")
     except Exception:
         pass
 
@@ -126,6 +134,13 @@ async def require_user_id(authorization: str = Header(None)) -> str:
     if not user_res.user:
         raise HTTPException(status_code=401, detail="Invalid session")
     return user_res.user.id
+
+
+async def require_admin(user_id: str = Depends(require_user_id)) -> str:
+    role = await get_user_role(user_id)
+    if (role or "").lower() != "admin":
+        raise HTTPException(status_code=403, detail="admin_required")
+    return user_id
 
 
 def _parse_form_bool(value: str) -> bool:
@@ -167,6 +182,12 @@ class EndSessionRequest(BaseModel):
 
 class CreateOrderRequest(BaseModel):
     plan_id: str
+
+class AdjustSessionsRequest(BaseModel):
+    delta: int = Field(
+        ...,
+        description="Sessions to add (positive) or remove (negative). Final value is clamped at 0.",
+    )
 
 class VerifyPaymentRequest(BaseModel):
     razorpay_payment_id: str
@@ -467,6 +488,27 @@ async def subscription_status(user_id: str = Depends(require_user_id)):
     }
 
 
+@app.post("/admin/users/{target_user_id}/sessions")
+async def admin_adjust_user_sessions(
+    target_user_id: str,
+    body: AdjustSessionsRequest,
+    _admin_id: str = Depends(require_admin),
+):
+    """
+    Admin-only: grant or revoke purchased sessions for a user.
+    Body: {"delta": <int>} — positive adds, negative removes (clamped at 0).
+    """
+    try:
+        UUID(target_user_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid user_id")
+
+    if not await get_auth_user_row(target_user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return await adjust_user_sessions(target_user_id, body.delta)
+
+
 @app.get("/subscription/purchases")
 async def subscription_purchases(user_id: str = Depends(require_user_id)):
     rows = await get_purchases(user_id)
@@ -548,11 +590,16 @@ async def analyse_screen(
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid session_id")
 
-    if not await interview_session_belongs_to_user(user_id, session_uuid):
+    # Read the upload and verify ownership concurrently — they're independent.
+    image_bytes, owns_session = await asyncio.gather(
+        file.read(),
+        interview_session_belongs_to_user(user_id, session_uuid),
+    )
+
+    if not owns_session:
         raise HTTPException(status_code=404, detail="Session not found")
 
     try:
-        image_bytes = await file.read()
         mime_type = file.content_type or "image/jpeg"
 
         logger.info(f"[/analyse_screen] Extracting text using {provider}")
@@ -575,7 +622,7 @@ async def analyse_screen(
         async def generate_and_save():
             full_response = ""
             yield json.dumps({"extracted_text": extracted_text}, ensure_ascii=False) + "\n"
-            generator_func = stream_gemini(prompt) if provider == "gemini" else stream_openai(prompt)
+            generator_func = select_stream(provider)(prompt)
             try:
                 async for chunk in generator_func:
                     full_response += chunk
@@ -614,10 +661,9 @@ async def ai_answer(
         except ValueError:
             raise HTTPException(status_code=422, detail="Invalid session_id")
 
-        if not await interview_session_belongs_to_user(user_id, session_uuid):
-            raise HTTPException(status_code=404, detail="Session not found")
-
         question = request.get_question()
+        # get_session_prompt_context already filters by user_id, so it doubles
+        # as the ownership check — no separate belongs-to-user query needed.
         ctx = await get_session_prompt_context(user_id, session_uuid)
         if not ctx:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -654,11 +700,7 @@ async def ai_answer(
 
         async def generate_and_save():
             full_response = ""
-            generator_func = (
-                stream_gemini(question, system_prompt=system_prompt)
-                if request.provider == "gemini"
-                else stream_openai(question, system_prompt=system_prompt)
-            )
+            generator_func = select_stream(request.provider)(question, system_prompt=system_prompt)
             try:
                 async for chunk in generator_func:
                     full_response += chunk

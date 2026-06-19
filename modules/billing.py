@@ -107,6 +107,35 @@ async def increment_free_sessions_used(user_id: str) -> None:
     )
 
 
+async def adjust_user_sessions(user_id: str, delta: int) -> dict:
+    """
+    Admin: grant (delta > 0) or revoke (delta < 0) purchased sessions for a user.
+    sessions_purchased is clamped at 0. Returns the user's updated session counts.
+    """
+    await provision_free_subscription(user_id)
+    await execute(
+        """
+        UPDATE public.subscriptions
+        SET sessions_purchased = GREATEST(0, sessions_purchased + $2),
+            updated_at         = now()
+        WHERE user_id = $1::uuid
+        """,
+        user_id,
+        delta,
+    )
+    sub = await get_subscription(user_id)
+    usage = await get_free_usage(user_id)
+    sessions_used = usage["sessions_used"] if usage else 0
+    sessions_purchased = sub["sessions_purchased"] if sub else 0
+    return {
+        "user_id": user_id,
+        "sessions_used": sessions_used,
+        "sessions_purchased": sessions_purchased,
+        "sessions_remaining": max(0, FREE_SESSION_LIMIT + sessions_purchased - sessions_used),
+        "plan_tier": sub["plan_tier"] if sub else "free",
+    }
+
+
 # ── Session duration ───────────────────────────────────────────────────────
 
 async def end_interview_session(user_id: str, session_id: str, duration_seconds: int) -> bool:

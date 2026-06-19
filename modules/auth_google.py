@@ -58,10 +58,11 @@ async def refresh_google_oauth_tokens(refresh_token: str) -> dict | None:
     profile = profile_resp.json()
     email = profile.get("email")
     name = profile.get("name", "")
+    image = profile.get("picture", "")
     if not email:
         return None
 
-    user = await _find_or_create_user(email=email, name=name)
+    user = await _find_or_create_user(email=email, name=name, image=image)
     access_token = mint_access_token(user["id"], user["email"])
 
     return {
@@ -70,22 +71,35 @@ async def refresh_google_oauth_tokens(refresh_token: str) -> dict | None:
     }
 
 
-async def _find_or_create_user(email: str, name: str) -> dict:
+async def _find_or_create_user(email: str, name: str, image: str = "") -> dict:
     row = await fetch_one(
         'SELECT id, email FROM neon_auth."user" WHERE email = $1',
         email,
     )
     if row:
-        return {"id": str(row["id"]), "email": row["email"]}
+        user_id_str = str(row["id"])
+        # Backfill name/image from the latest Google profile without overwriting
+        # an existing value with a blank one.
+        await execute(
+            '''
+            UPDATE neon_auth."user"
+            SET name = COALESCE(NULLIF($2, ''), name),
+                image = COALESCE(NULLIF($3, ''), image),
+                "updatedAt" = now()
+            WHERE id = $1::uuid
+            ''',
+            user_id_str, name, image,
+        )
+        return {"id": user_id_str, "email": row["email"]}
 
     # Let the DB generate the id; supply emailVerified=true since Google has verified it.
     new_row = await fetch_one(
         '''
-        INSERT INTO neon_auth."user" (name, email, "emailVerified")
-        VALUES ($1, $2, true)
+        INSERT INTO neon_auth."user" (name, email, "emailVerified", image)
+        VALUES ($1, $2, true, NULLIF($3, ''))
         RETURNING id, email
         ''',
-        name, email,
+        name, email, image,
     )
     user_id_str = str(new_row["id"])
     await provision_free_subscription(user_id_str)
@@ -158,10 +172,11 @@ async def google_callback_web(
     profile = profile_resp.json()
     email = profile.get("email")
     name  = profile.get("name", "")
+    image = profile.get("picture", "")
     if not email:
         return _error_redirect("no_email_from_google")
 
-    user = await _find_or_create_user(email=email, name=name)
+    user = await _find_or_create_user(email=email, name=name, image=image)
     access_token  = mint_access_token(user["id"], user["email"])
     refresh_token = await issue_refresh_token(user["id"])
 
@@ -256,12 +271,13 @@ async def google_callback(
     profile = profile_resp.json()
     email = profile.get("email")
     name  = profile.get("name", "")
+    image = profile.get("picture", "")
 
     if not email:
         return _error_redirect(local_port, "no_email_from_google")
 
     # 5. Find or create the user in the database
-    user = await _find_or_create_user(email=email, name=name)
+    user = await _find_or_create_user(email=email, name=name, image=image)
 
     # 6. Mint a JWT access token compatible with require_user_id (HS256)
     access_token  = mint_access_token(user["id"], user["email"])
