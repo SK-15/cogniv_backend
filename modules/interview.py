@@ -162,6 +162,27 @@ async def create_interview_session(
         return None
 
 
+async def get_open_interview_session(user_id: str) -> UUID | None:
+    """Return the id of the user's most recent not-yet-ended session, if any."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id
+                FROM public.interview_sessions
+                WHERE user_id = $1::uuid AND ended_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                user_id,
+            )
+        return row["id"] if row else None
+    except Exception as e:
+        print(f"Error checking open interview session: {e}")
+        return None
+
+
 async def interview_session_belongs_to_user(user_id: str, session_id: UUID) -> bool:
     """True if interview_sessions row exists for this id and user."""
     try:

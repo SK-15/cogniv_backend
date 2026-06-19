@@ -30,6 +30,7 @@ from modules.interview import (
     list_interview_sessions,
     save_interview_profile,
     create_interview_session,
+    get_open_interview_session,
     insert_interview_response,
     interview_session_belongs_to_user,
     get_session_prompt_context,
@@ -428,12 +429,17 @@ async def start_interview_session(
         raise HTTPException(
             status_code=402,
             detail={
-                "error": "free_quota_exceeded",
-                "message": "Free sessions exhausted. Upgrade to Pro for unlimited sessions.",
-                "sessions_used": FREE_SESSION_LIMIT,
+                "error": "quota_exceeded",
+                "message": "No sessions remaining. Purchase a plan to start a new session.",
                 "sessions_remaining": 0,
             },
         )
+
+    # Guard against double-submit: if the user already has an unended session,
+    # return it instead of creating (and charging for) a duplicate.
+    open_session_id = await get_open_interview_session(user_id)
+    if open_session_id:
+        return {"session_id": str(open_session_id), "reused": True}
 
     try:
         profile_uuid = UUID(body.profile_id)
@@ -449,8 +455,8 @@ async def start_interview_session(
     if not session_id:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    if quota["reason"] == "free":
-        await increment_free_sessions_used(user_id)
+    # Session started successfully — consume one credit (free or purchased).
+    await increment_free_sessions_used(user_id)
 
     return {"session_id": str(session_id)}
 

@@ -758,6 +758,42 @@ Real-time audio transcription using Deepgram. Accepts raw audio bytes and stream
 
 ---
 
+### 31. Admin — Adjust User Sessions
+**Admin-only.** Grant or revoke purchased sessions for any user. The caller's account must have `role = "admin"`.
+
+*   **URL**: `/admin/users/{target_user_id}/sessions`
+*   **Method**: `POST`
+*   **Headers**:
+    *   `Authorization: Bearer <access_token>` (must belong to an admin)
+    *   `Content-Type: application/json`
+*   **Path Parameters**:
+    *   `target_user_id`: **Required**. UUID of the user whose sessions are being adjusted.
+*   **Request Body**:
+    ```json
+    { "delta": 5 }
+    ```
+    *   `delta`: **Required**. Integer. Positive **adds** sessions, negative **removes** them. The stored `sessions_purchased` total is clamped at `0` (cannot go negative).
+*   **Success Response**:
+    *   **Code**: 200 OK
+    *   **Content**:
+        ```json
+        {
+          "user_id": "uuid",
+          "sessions_used": 3,
+          "sessions_purchased": 10,
+          "sessions_remaining": 8,
+          "plan_tier": "free"
+        }
+        ```
+        *   Same shape used elsewhere for quota display — `sessions_remaining = max(0, free_session_limit + sessions_purchased - sessions_used)`.
+*   **Error Responses**:
+    *   **Code**: 403 Forbidden — `{ "detail": "admin_required" }` (caller is not an admin)
+    *   **Code**: 422 Unprocessable Entity — `{ "detail": "invalid user_id" }` (malformed UUID)
+    *   **Code**: 404 Not Found — `{ "detail": "User not found" }`
+    *   **Code**: 401 Unauthorized — missing/invalid token
+
+---
+
 ## Testing with cURL
 
 ### Signup
@@ -941,6 +977,14 @@ curl -X POST "http://localhost:8000/payment/verify" \
 ```bash
 curl -X POST "http://localhost:8000/subscription/cancel" \
      -H "Authorization: Bearer <TOKEN>"
+```
+
+### Admin — adjust user sessions
+```bash
+curl -X POST "http://localhost:8000/admin/users/<TARGET_USER_ID>/sessions" \
+     -H "Authorization: Bearer <ADMIN_TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{"delta": 5}'
 ```
 
 ---

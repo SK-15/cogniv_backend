@@ -8,7 +8,7 @@ from modules.database import fetch_one, fetch_all, execute
 
 rz_client = razorpay.Client(auth=(settings.razorpay_key_id, settings.razorpay_key_secret))
 
-FREE_SESSION_LIMIT = 3
+FREE_SESSION_LIMIT = 2
 
 PLAN_CONFIG = {
     "starter": {"amount": 79900,  "sessions": 7},
@@ -212,7 +212,7 @@ async def credit_sessions(user_id: str, plan_id: str, order_id: str, payment_id:
         UPDATE public.subscriptions
         SET sessions_purchased  = sessions_purchased + $2,
             plan_tier           = $3,
-            current_period_end  = now() AT TIME ZONE 'UTC' + INTERVAL '30 days',
+            current_period_end  = NULL,
             updated_at          = now()
         WHERE user_id = $1::uuid
         """,
