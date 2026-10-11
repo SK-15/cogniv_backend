@@ -459,7 +459,11 @@ Get all interview profiles for the authenticated user.
     *   **Code**: 401 Unauthorized
 
 ### 16. Start Interview Session
-Create a session for a given profile and job context. The profile must belong to the authenticated user.
+Create a session for a given profile and job context. The profile must belong to the authenticated user. Starting a session spends one session credit.
+
+**Session length cap (enforced server-side):** 10 minutes on the free tier, 30 minutes on any paid tier, plus a 2-minute grace period. Past that, `/ai-answer`, `/analyse-screen` and `/deepgram/token` return `410 session_ended` and the session is closed at its cap.
+
+**Unended previous session:** if the user's latest session is still open, the same request (same `profile_id`, `job_title`, `job_description`) within its cap returns that session with `"reused": true` and no charge (double-submit / app restart). Otherwise the old session is closed and a new one is created and charged.
 
 *   **URL**: `/interview/session`
 *   **Method**: `POST`
@@ -482,9 +486,11 @@ Create a session for a given profile and job context. The profile must belong to
           "session_id": "uuid-of-new-session"
         }
         ```
+        or, for a reused open session, `{ "session_id": "...", "reused": true }`.
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
-    *   **Code**: 404 Not Found (profile missing or not owned by user)
+    *   **Code**: 402 Payment Required (`{"detail": {"error": "quota_exceeded", ...}}` — no session credits left)
+    *   **Code**: 404 Not Found (profile missing or not owned by user; the credit is refunded)
     *   **Code**: 422 Unprocessable Entity (invalid `profile_id`)
 
 ### 17. Analyse Screen (Text Extraction & Q&A, Streaming)
@@ -509,6 +515,10 @@ Extract raw text from an uploaded image, then **stream** an LLM answer for any q
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
     *   **Code**: 404 Not Found (session not found or not owned)
+    *   **Code**: 410 Gone — the session has ended, or ran past its length cap (it is closed at the cap):
+        ```json
+        { "detail": { "error": "session_ended", "message": "This session has ended. Start a new session to continue." } }
+        ```
     *   **Code**: 422 Unprocessable Entity (invalid `session_id`)
     *   **Code**: 500 Internal Server Error
 
@@ -540,30 +550,45 @@ Answer a question using OpenAI or Gemini with a **streaming** response (same as 
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
     *   **Code**: 404 Not Found (session not found or not owned)
+    *   **Code**: 410 Gone — the session has ended, or ran past its length cap (it is closed at the cap):
+        ```json
+        { "detail": { "error": "session_ended", "message": "This session has ended. Start a new session to continue." } }
+        ```
     *   **Code**: 422 Unprocessable Entity (invalid `session_id` or missing question field)
     *   **Code**: 500 Internal Server Error
 
-### 19. Get Gemini API Key
-Return the server-side Gemini API key for client-side use.
+### 19. Deepgram Transcription Token
+Short-lived Deepgram token for streaming transcription straight to Deepgram. The account API key never leaves the server (the old `GET /deepgram/api_key` and `GET /gemini/api_key` endpoints are removed). The token only has to be valid when the WebSocket opens (60 s TTL); the stream keeps running after it expires. Requires an active interview session.
 
-*   **URL**: `/gemini/api_key`
-*   **Method**: `GET`
+*   **URL**: `/deepgram/token`
+*   **Method**: `POST`
 *   **Headers**:
     *   `Authorization: Bearer <access_token>`
+    *   `Content-Type: application/json`
+*   **Request Body**:
+    ```json
+    { "session_id": "uuid-of-active-interview-session" }
+    ```
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content**:
         ```json
-        {
-          "gemini_api_key": "AIza..."
-        }
+        { "access_token": "eyJ...", "expires_in": 60 }
         ```
+*   **Using the token**: open `wss://api.deepgram.com/v1/listen?...` with header `Authorization: Bearer <access_token>` (server/Node), or WebSocket subprotocols `['bearer', <access_token>]` in a browser.
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
-    *   **Code**: 503 Service Unavailable (key not configured in .env)
+    *   **Code**: 404 Not Found (session not found or not owned)
+    *   **Code**: 410 Gone — the session has ended, or ran past its length cap (it is closed at the cap):
+        ```json
+        { "detail": { "error": "session_ended", "message": "This session has ended. Start a new session to continue." } }
+        ```
+    *   **Code**: 422 Unprocessable Entity (invalid `session_id`)
+    *   **Code**: 502 Bad Gateway (Deepgram refused or could not be reached)
+    *   **Code**: 503 Service Unavailable (`DEEPGRAM_API_KEY` not configured)
 
 ### 20. End Interview Session
-Mark a session as ended and store its duration.
+Mark a session as ended and store its duration. The stored `duration_seconds` is the client's value, capped at the time actually elapsed since the session started.
 
 *   **URL**: `/interview/session/{session_id}/end`
 *   **Method**: `PATCH`
@@ -699,7 +724,9 @@ Create a Razorpay subscription and return credentials to open the checkout modal
 ---
 
 ### 27. Verify Payment
-Verify Razorpay payment signature after checkout modal success and activate Pro plan.
+Confirm a Razorpay checkout and credit the plan's sessions. Called from the checkout `handler` callback.
+
+The checkout signature is verified, then the order and payment are fetched from Razorpay: the plan, price and owner come from the order (created by `/payment/create-order` with `notes.plan_id` and `notes.user_id`), and the payment must be `captured` (an `authorized` payment is captured here). If Razorpay cannot be reached nothing is credited — the webhook (§29) credits the order once Razorpay delivers it. Crediting is idempotent per `order_id`, so verify and the webhook never double-credit.
 
 *   **URL**: `/payment/verify`
 *   **Method**: `POST`
@@ -709,24 +736,23 @@ Verify Razorpay payment signature after checkout modal success and activate Pro 
 *   **Request Body**:
     ```json
     {
+      "razorpay_order_id": "order_...",
       "razorpay_payment_id": "pay_...",
-      "razorpay_subscription_id": "sub_...",
-      "razorpay_signature": "signature-string"
+      "razorpay_signature": "signature-string",
+      "plan_id": "starter"
     }
     ```
-    All three fields come from the Razorpay checkout `handler` callback.
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content**:
         ```json
-        {
-          "ok": true,
-          "plan_tier": "pro"
-        }
+        { "ok": true, "sessions_credited": 7 }
         ```
 *   **Error Response**:
-    *   **Code**: 400 Bad Request (signature mismatch)
+    *   **Code**: 400 Bad Request (signature mismatch, unknown plan, `plan_id` differs from the order, or the payment is unpaid / wrong amount)
     *   **Code**: 401 Unauthorized
+    *   **Code**: 403 Forbidden (the order was created by another account)
+    *   **Code**: 502 Bad Gateway (Razorpay unreachable — nothing credited; the webhook will credit it)
 
 ---
 
@@ -753,39 +779,21 @@ Cancel the active Pro subscription at the end of the current billing period.
 ---
 
 ### 29. Razorpay Webhook
-Receives Razorpay subscription lifecycle events. No auth — validated by Razorpay HMAC signature header.
+Credits a paid order even if the client never reaches `/payment/verify` (app closed, network drop). No auth — validated by the Razorpay HMAC signature header. Applies the same Razorpay checks as §27 and credits the user in the order's `notes.user_id`.
 
-*   **URL**: `/subscription/webhook`
+**Setup:** Razorpay Dashboard → Settings → Webhooks → URL `https://<host>/payment/webhook`, events `payment.captured` and `order.paid` (optionally `payment.authorized` if auto-capture is off), and set the same secret as `RAZORPAY_WEBHOOK_SECRET` on the server.
+
+*   **URL**: `/payment/webhook`
 *   **Method**: `POST`
 *   **Headers**:
-    *   `x-razorpay-signature`: Razorpay HMAC-SHA256 signature over the raw body
-*   **Events handled**:
-    *   `subscription.charged` → sets `plan_tier='pro'`, updates `current_period_end`
-    *   `subscription.halted` → sets `status='past_due'`
-    *   `subscription.cancelled` → downgrades to `plan_tier='free'`
+    *   `X-Razorpay-Signature`: HMAC-SHA256 of the raw body with `RAZORPAY_WEBHOOK_SECRET`
+*   **Events handled**: `payment.authorized`, `payment.captured`, `order.paid`; others are acknowledged and ignored.
 *   **Success Response**:
     *   **Code**: 200 OK
-    *   **Content**: `{ "received": true }`
+    *   **Content**: `{ "ok": true, "credited": true }` (`false` if already credited), or `{ "ok": true, "ignored": true }`
 *   **Error Response**:
-    *   **Code**: 400 Bad Request (invalid signature)
-
----
-
-### 30. Live Audio Transcription (WebSocket)
-Real-time audio transcription using Deepgram. Accepts raw audio bytes and streams back transcribed text.
-
-*   **URL**: `/listen`
-*   **Protocol**: `WebSocket`
-*   **Connection URL**: `ws://localhost:8000/listen`
-*   **Audio Format**: 
-    - **Encoding**: `linear16` (Raw PCM)
-    - **Sample Rate**: `16000 Hz`
-    - **Channels**: `1` (Mono)
-*   **Request (Binary Frames)**: Send raw audio bytes according to the format above.
-*   **Response (Text Frames)**: Real-time transcript strings.
-*   **Error Handling**:
-    - Disconnects on internal error or Deepgram timeout.
-    - Sends specialized error text if API keys are missing.
+    *   **Code**: 400 Bad Request (invalid signature or JSON)
+    *   **Code**: 503 Service Unavailable (secret not configured, or Razorpay unreachable — Razorpay retries)
 
 ---
 
@@ -1107,7 +1115,7 @@ curl -X POST "http://localhost:8000/payment/create-order" \
 curl -X POST "http://localhost:8000/payment/verify" \
      -H "Authorization: Bearer <TOKEN>" \
      -H "Content-Type: application/json" \
-     -d '{"razorpay_payment_id":"pay_...","razorpay_subscription_id":"sub_...","razorpay_signature":"..."}'
+     -d '{"razorpay_order_id":"order_...","razorpay_payment_id":"pay_...","razorpay_signature":"...","plan_id":"starter"}'
 ```
 
 ### Cancel subscription

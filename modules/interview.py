@@ -162,25 +162,56 @@ async def create_interview_session(
         return None
 
 
-async def get_open_interview_session(user_id: str) -> UUID | None:
-    """Return the id of the user's most recent not-yet-ended session, if any."""
+async def get_open_interview_session(user_id: str) -> dict | None:
+    """
+    The user's most recent not-yet-ended session, if any.
+    Shape: { "id": UUID, "profile_id": UUID, "job_title": str, "job_description": str,
+             "elapsed_seconds": float, "plan_tier": str }
+    """
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id
-                FROM public.interview_sessions
-                WHERE user_id = $1::uuid AND ended_at IS NULL
-                ORDER BY started_at DESC
+                SELECT
+                    s.id,
+                    s.profile_id,
+                    s.job_title,
+                    s.job_description,
+                    EXTRACT(EPOCH FROM now() - s.started_at)::float8 AS elapsed_seconds,
+                    COALESCE(sub.plan_tier, 'free') AS plan_tier
+                FROM public.interview_sessions s
+                LEFT JOIN public.subscriptions sub ON sub.user_id = s.user_id
+                WHERE s.user_id = $1::uuid AND s.ended_at IS NULL
+                ORDER BY s.started_at DESC
                 LIMIT 1
                 """,
                 user_id,
             )
-        return row["id"] if row else None
+        return dict(row) if row else None
     except Exception as e:
         print(f"Error checking open interview session: {e}")
         return None
+
+
+async def close_expired_session(user_id: str, session_id: UUID, limit_seconds: int) -> None:
+    """End a session the client never closed, billing it at exactly its cap."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE public.interview_sessions
+                SET ended_at = started_at + ($3::int * interval '1 second'),
+                    duration_seconds = $3::int
+                WHERE id = $1 AND user_id = $2::uuid AND ended_at IS NULL
+                """,
+                session_id,
+                user_id,
+                limit_seconds,
+            )
+    except Exception as e:
+        print(f"Error closing expired interview session: {e}")
 
 
 async def interview_session_belongs_to_user(user_id: str, session_id: UUID) -> bool:
@@ -205,8 +236,10 @@ async def interview_session_belongs_to_user(user_id: str, session_id: UUID) -> b
 
 async def get_session_prompt_context(user_id: str, session_id: UUID) -> dict | None:
     """
-    Returns resume + job context for a session owned by user.
-    Shape: { "resume_text": str|None, "job_title": str|None, "job_description": str|None }
+    Returns resume + job context for a session owned by user, plus what is
+    needed to decide whether the session may still be used.
+    Shape: { "resume_text": str|None, "job_title": str|None, "job_description": str|None,
+             "ended_at": datetime|None, "elapsed_seconds": float, "plan_tier": str }
     """
     try:
         pool = await get_pool()
@@ -216,9 +249,13 @@ async def get_session_prompt_context(user_id: str, session_id: UUID) -> dict | N
                 SELECT
                     p.resume_text,
                     s.job_title,
-                    s.job_description
+                    s.job_description,
+                    s.ended_at,
+                    EXTRACT(EPOCH FROM now() - s.started_at)::float8 AS elapsed_seconds,
+                    COALESCE(sub.plan_tier, 'free') AS plan_tier
                 FROM public.interview_sessions s
                 LEFT JOIN public.interview_profiles p ON p.id = s.profile_id
+                LEFT JOIN public.subscriptions sub ON sub.user_id = s.user_id
                 WHERE s.id = $1 AND s.user_id = $2::uuid
                 """,
                 session_id,

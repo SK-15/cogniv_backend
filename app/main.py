@@ -1,11 +1,9 @@
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Depends, Header, Query, UploadFile, File, Form, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from typing import Optional
-from deepgram import DeepgramClient
-from deepgram.core.events import EventType
 from modules.config import settings
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -13,6 +11,8 @@ from slowapi.errors import RateLimitExceeded
 
 import asyncio
 import json
+
+import httpx
 
 import logging
 from fastapi.responses import StreamingResponse
@@ -31,8 +31,8 @@ from modules.interview import (
     save_interview_profile,
     create_interview_session,
     get_open_interview_session,
+    close_expired_session,
     insert_interview_response,
-    interview_session_belongs_to_user,
     get_session_prompt_context,
 )
 from modules.launch_signup import insert_launch_signup
@@ -47,19 +47,23 @@ from modules.database import fetch_one, get_pool
 from modules.billing import (
     FREE_SESSION_LIMIT,
     PLAN_CONFIG,
+    PaymentError,
     adjust_user_sessions,
     check_can_purchase,
-    check_can_start_session,
+    confirm_paid_order,
+    consume_session_credit,
     create_order,
     credit_sessions,
     end_interview_session,
     get_free_usage,
     get_purchases,
     get_subscription,
-    increment_free_sessions_used,
     provision_free_subscription,
-    rz_client,
+    refund_session_credit,
+    session_limit_for_tier,
+    session_state,
     verify_payment_signature,
+    verify_webhook_signature,
 )
 
 logging.basicConfig(
@@ -151,6 +155,36 @@ async def require_admin(user_id: str = Depends(require_user_id)) -> str:
     return user_id
 
 
+def _parse_session_id(session_id: str) -> UUID:
+    try:
+        return UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid session_id")
+
+
+async def require_active_session(user_id: str, session_id: UUID) -> dict:
+    """
+    The session's prompt context, if it belongs to the user and is still
+    running. A session past its cap is closed here, so a client that never
+    calls the end endpoint cannot keep one credit alive forever.
+    """
+    ctx = await get_session_prompt_context(user_id, session_id)
+    if not ctx:
+        raise HTTPException(status_code=404, detail="Session not found")
+    state = session_state(ctx["ended_at"], ctx["elapsed_seconds"], ctx["plan_tier"])
+    if state == "expired":
+        await close_expired_session(user_id, session_id, session_limit_for_tier(ctx["plan_tier"]))
+    if state != "active":
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "session_ended",
+                "message": "This session has ended. Start a new session to continue.",
+            },
+        )
+    return ctx
+
+
 def _parse_form_bool(value: str) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "on")
 
@@ -216,6 +250,9 @@ class AdjustSessionsRequest(BaseModel):
         ...,
         description="Sessions to add (positive) or remove (negative). Final value is clamped at 0.",
     )
+
+class DeepgramTokenRequest(BaseModel):
+    session_id: str
 
 class VerifyPaymentRequest(BaseModel):
     razorpay_payment_id: str
@@ -330,20 +367,43 @@ async def logout(body: RefreshTokenRequest):
     return {"message": "logged_out"}
 
 
-@app.get("/deepgram/api_key")
-async def get_deepgram_api_key(_user_id: str = Depends(require_user_id)):
-    """Return the Deepgram API key for client-side streaming. Requires a valid Bearer token."""
+DEEPGRAM_GRANT_URL = "https://api.deepgram.com/v1/auth/grant"
+DEEPGRAM_TOKEN_TTL_SECONDS = 60
+
+
+@app.post("/deepgram/token")
+async def deepgram_token(
+    body: DeepgramTokenRequest,
+    user_id: str = Depends(require_user_id),
+):
+    """
+    Short-lived Deepgram token for streaming transcription — the account API key
+    never leaves the server. The token only has to be valid when the client opens
+    its WebSocket; the stream keeps running after it expires. Requires an active
+    interview session, so transcription is always backed by a session credit.
+    """
+    session_uuid = _parse_session_id(body.session_id)
+    await require_active_session(user_id, session_uuid)
+
     if not settings.deepgram_api_key:
-        raise HTTPException(status_code=503, detail="Deepgram API key not configured")
-    return {"deepgram_api_key": settings.deepgram_api_key}
-
-
-@app.get("/gemini/api_key")
-async def get_gemini_api_key(_user_id: str = Depends(require_user_id)):
-    """Return the Gemini API key for client-side use. Requires a valid Bearer token."""
-    if not settings.gemini_api_key:
-        raise HTTPException(status_code=503, detail="Gemini API key not configured")
-    return {"gemini_api_key": settings.gemini_api_key}
+        raise HTTPException(status_code=503, detail="Transcription is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(
+                DEEPGRAM_GRANT_URL,
+                headers={"Authorization": f"Token {settings.deepgram_api_key}"},
+                json={"ttl_seconds": DEEPGRAM_TOKEN_TTL_SECONDS},
+            )
+        res.raise_for_status()
+        data = res.json()
+        access_token = data["access_token"]
+    except Exception as e:
+        logger.error("[/deepgram/token] Deepgram grant failed: %s", e)
+        raise HTTPException(status_code=502, detail="Could not start transcription. Try again.")
+    return {
+        "access_token": access_token,
+        "expires_in": data.get("expires_in", DEEPGRAM_TOKEN_TTL_SECONDS),
+    }
 
 
 @app.post("/launch_signup")
@@ -544,8 +604,32 @@ async def start_interview_session(
     body: InterviewSessionRequest,
     user_id: str = Depends(require_user_id),
 ):
-    quota = await check_can_start_session(user_id)
-    if not quota["allowed"]:
+    try:
+        profile_uuid = UUID(body.profile_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid profile_id")
+
+    open_session = await get_open_interview_session(user_id)
+    if open_session:
+        state = session_state(None, open_session["elapsed_seconds"], open_session["plan_tier"])
+        same_request = (
+            open_session["profile_id"] == profile_uuid
+            and open_session["job_title"] == body.job_title
+            and open_session["job_description"] == body.job_description
+        )
+        if state == "active" and same_request:
+            # Double-submit (or app restart mid-session): hand back the running
+            # session instead of creating and charging for a duplicate.
+            return {"session_id": str(open_session["id"]), "reused": True}
+        # The client never ended its previous session. Close it — at its cap if
+        # it overran, otherwise at the time actually elapsed.
+        limit = session_limit_for_tier(open_session["plan_tier"])
+        if state == "expired":
+            await close_expired_session(user_id, open_session["id"], limit)
+        else:
+            await end_interview_session(user_id, str(open_session["id"]), limit)
+
+    if not await consume_session_credit(user_id):
         raise HTTPException(
             status_code=402,
             detail={
@@ -555,17 +639,6 @@ async def start_interview_session(
             },
         )
 
-    # Guard against double-submit: if the user already has an unended session,
-    # return it instead of creating (and charging for) a duplicate.
-    open_session_id = await get_open_interview_session(user_id)
-    if open_session_id:
-        return {"session_id": str(open_session_id), "reused": True}
-
-    try:
-        profile_uuid = UUID(body.profile_id)
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Invalid profile_id")
-
     session_id = await create_interview_session(
         user_id,
         profile_uuid,
@@ -573,10 +646,8 @@ async def start_interview_session(
         body.job_description,
     )
     if not session_id:
+        await refund_session_credit(user_id)
         raise HTTPException(status_code=404, detail="Profile not found")
-
-    # Session started successfully — consume one credit (free or purchased).
-    await increment_free_sessions_used(user_id)
 
     return {"session_id": str(session_id)}
 
@@ -673,9 +744,10 @@ async def payment_create_order(body: CreateOrderRequest, request: Request, user_
         raise HTTPException(status_code=400, detail=f"Unknown plan: {body.plan_id}")
     await check_can_purchase(user_id, body.plan_id)
     try:
-        data = await create_order(body.plan_id)
+        data = await asyncio.to_thread(create_order, body.plan_id, user_id)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Razorpay error: {e}")
+        logger.error("[/payment/create-order] Razorpay error: %s", e)
+        raise HTTPException(status_code=502, detail="Could not create the order. Try again.")
     return data  # {order_id, amount, currency, key_id}
 
 
@@ -693,23 +765,81 @@ async def payment_verify(
     )
     if not valid:
         raise HTTPException(status_code=400, detail="Signature mismatch — payment not verified")
-    # Verify plan_id matches the order to prevent plan forgery
+
+    # The signature only proves Razorpay saw this order/payment pair. What was
+    # bought, by whom, and whether it was paid comes from Razorpay itself — and
+    # if Razorpay can't be reached we credit nothing (the webhook retries later).
     try:
-        order = rz_client.order.fetch(body.razorpay_order_id)
-        server_plan_id = order.get("notes", {}).get("plan_id")
-        if server_plan_id and server_plan_id != body.plan_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Plan mismatch — payment was for a different plan",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # If Razorpay fetch fails, proceed (signature already verified)
-    await provision_free_subscription(user_id)
-    await credit_sessions(user_id, body.plan_id, body.razorpay_order_id, body.razorpay_payment_id)
-    sessions = PLAN_CONFIG[body.plan_id]["sessions"]
-    return {"ok": True, "sessions_credited": sessions}
+        paid = await asyncio.to_thread(
+            confirm_paid_order, body.razorpay_order_id, body.razorpay_payment_id
+        )
+    except PaymentError as e:
+        logger.warning("[/payment/verify] Rejected order %s: %s", body.razorpay_order_id, e)
+        raise HTTPException(status_code=400, detail=f"Payment not verified: {e}")
+    except Exception as e:
+        logger.error("[/payment/verify] Razorpay check failed for order %s: %s", body.razorpay_order_id, e)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not confirm the payment with Razorpay. If you were charged, "
+                   "your sessions will be added automatically within a few minutes.",
+        )
+
+    # Orders created before user_id was recorded in notes carry no owner.
+    if paid["user_id"] and paid["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="This payment belongs to another account")
+    if paid["plan_id"] != body.plan_id:
+        raise HTTPException(status_code=400, detail="Plan mismatch — payment was for a different plan")
+
+    await credit_sessions(user_id, paid["plan_id"], body.razorpay_order_id, body.razorpay_payment_id)
+    return {"ok": True, "sessions_credited": PLAN_CONFIG[paid["plan_id"]]["sessions"]}
+
+
+RAZORPAY_PAYMENT_EVENTS = {"payment.authorized", "payment.captured", "order.paid"}
+
+
+@app.post("/payment/webhook")
+async def payment_webhook(request: Request):
+    """
+    Razorpay webhook. Credits a paid order even when the client never reaches
+    /payment/verify (app closed, network drop). Idempotent with /payment/verify
+    through purchases.order_id. Configure on the Razorpay dashboard with the
+    payment.captured and order.paid events and RAZORPAY_WEBHOOK_SECRET.
+    """
+    if not settings.razorpay_webhook_secret:
+        logger.error("[/payment/webhook] RAZORPAY_WEBHOOK_SECRET is not set")
+        raise HTTPException(status_code=503, detail="Webhook not configured")
+    body = await request.body()
+    if not verify_webhook_signature(body, request.headers.get("X-Razorpay-Signature", "")):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    try:
+        event = json.loads(body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if event.get("event") not in RAZORPAY_PAYMENT_EVENTS:
+        return {"ok": True, "ignored": True}
+    payment = ((event.get("payload") or {}).get("payment") or {}).get("entity") or {}
+    order_id, payment_id = payment.get("order_id"), payment.get("id")
+    if not order_id or not payment_id:
+        return {"ok": True, "ignored": True}
+
+    try:
+        paid = await asyncio.to_thread(confirm_paid_order, order_id, payment_id)
+    except PaymentError as e:
+        # A bad payment won't become good on retry — acknowledge it.
+        logger.warning("[/payment/webhook] Rejected order %s: %s", order_id, e)
+        return {"ok": True, "ignored": True}
+    except Exception as e:
+        # Non-2xx makes Razorpay retry the delivery.
+        logger.error("[/payment/webhook] Razorpay check failed for order %s: %s", order_id, e)
+        raise HTTPException(status_code=503, detail="Could not confirm payment")
+
+    if not paid["user_id"]:
+        logger.error("[/payment/webhook] Order %s has no user_id note; credit it manually", order_id)
+        return {"ok": True, "ignored": True}
+
+    credited = await credit_sessions(paid["user_id"], paid["plan_id"], order_id, payment_id)
+    return {"ok": True, "credited": credited}
 
 
 @app.post("/analyse-screen")
@@ -724,19 +854,13 @@ async def analyse_screen(
     The first line of the response body is a JSON object: {"extracted_text": "..."}.
     Remaining bytes are the streamed answer text.
     """
-    try:
-        session_uuid = UUID(session_id)
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Invalid session_id")
+    session_uuid = _parse_session_id(session_id)
 
-    # Read the upload and verify ownership concurrently — they're independent.
-    image_bytes, owns_session = await asyncio.gather(
+    # Read the upload and check the session concurrently — they're independent.
+    image_bytes, _ctx = await asyncio.gather(
         file.read(),
-        interview_session_belongs_to_user(user_id, session_uuid),
+        require_active_session(user_id, session_uuid),
     )
-
-    if not owns_session:
-        raise HTTPException(status_code=404, detail="Session not found")
 
     try:
         mime_type = file.content_type or "image/jpeg"
@@ -795,17 +919,11 @@ async def ai_answer(
     user_id: str = Depends(require_user_id),
 ):
     try:
-        try:
-            session_uuid = UUID(request.session_id)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid session_id")
+        session_uuid = _parse_session_id(request.session_id)
 
         question = request.get_question()
-        # get_session_prompt_context already filters by user_id, so it doubles
-        # as the ownership check — no separate belongs-to-user query needed.
-        ctx = await get_session_prompt_context(user_id, session_uuid)
-        if not ctx:
-            raise HTTPException(status_code=404, detail="Session not found")
+        # Checks ownership too — the lookup filters by user_id.
+        ctx = await require_active_session(user_id, session_uuid)
 
         resume_text = (ctx.get("resume_text") or "").strip()
         job_title = (ctx.get("job_title") or "").strip()
@@ -864,126 +982,6 @@ async def ai_answer(
     except Exception as e:
         logger.error(f"AI Answer endpoint error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.websocket("/listen")
-async def websocket_endpoint(websocket: WebSocket, token: str = None):
-    """
-    WebSocket endpoint for live audio transcription using Deepgram.
-    Accepts raw audio bytes from the client and streams back transcribed text.
-    
-    Connect via: ws://host/listen
-    Send: raw LINEAR16 PCM audio at 16000 Hz, mono, as binary frames
-    Receive: streamed transcript strings as text frames
-    """
-    await websocket.accept()
-    logger.info("[/listen] WebSocket client connected")
-
-    if not settings.deepgram_api_key:
-        await websocket.send_text("Error: Deepgram API key not configured.")
-        await websocket.close()
-        return
-
-    deepgram = DeepgramClient(api_key=settings.deepgram_api_key)
-    loop = asyncio.get_event_loop()
-
-    # Thread-safe queue: async WS receiver puts audio → sync thread sends to Deepgram
-    import queue as thread_queue
-    import threading
-
-    audio_q: thread_queue.Queue = thread_queue.Queue()
-    stop_event = threading.Event()
-
-    def deepgram_worker():
-        """
-        Runs in a background thread.
-        Opens a Deepgram v1 streaming connection, then:
-          - Thread A: calls start_listening() — blocks, reads transcripts, fires callbacks
-          - Thread B: drains audio_q and sends audio bytes to Deepgram
-        """
-        try:
-            with deepgram.listen.v1.connect(
-                model="nova-2",
-                encoding="linear16",
-                sample_rate=16000,
-                channels=1,
-                smart_format="true",
-                interim_results="true",
-            ) as connection:
-                logger.info("[/listen] Deepgram connection opened")
-
-                def on_message(message):
-                    try:
-                        transcript = None
-                        channel = getattr(message, "channel", None)
-                        if channel:
-                            alts = getattr(channel, "alternatives", None)
-                            if alts:
-                                transcript = alts[0].transcript
-                        if not transcript:
-                            transcript = getattr(message, "transcript", None)
-                        if transcript:
-                            logger.info(f"[/listen] Transcript: {transcript}")
-                            asyncio.run_coroutine_threadsafe(
-                                websocket.send_text(transcript), loop
-                            )
-                    except Exception as e:
-                        logger.error(f"[/listen] on_message error: {e}")
-
-                connection.on(EventType.MESSAGE, on_message)
-                connection.on(EventType.ERROR, lambda e: logger.error(f"[/listen] Deepgram error: {e}"))
-                connection.on(EventType.OPEN, lambda _: logger.info("[/listen] Deepgram stream started"))
-                connection.on(EventType.CLOSE, lambda _: logger.info("[/listen] Deepgram stream closed"))
-
-                # Thread A: blocking receive — reads transcripts from Deepgram
-                listen_thread = threading.Thread(target=connection.start_listening, daemon=True)
-                listen_thread.start()
-
-                # Thread B (this thread): send audio chunks to Deepgram
-                while not stop_event.is_set():
-                    try:
-                        data = audio_q.get(timeout=0.5)
-                        connection._send(data)
-                    except thread_queue.Empty:
-                        continue
-                    except Exception as e:
-                        logger.error(f"[/listen] send error: {e}")
-                        break
-
-                # Signal Deepgram we're done, wait for listen thread
-                try:
-                    connection._send(b"")  # empty close message
-                except Exception:
-                    pass
-                listen_thread.join(timeout=3.0)
-
-        except Exception as e:
-            logger.error(f"[/listen] Deepgram worker error: {e}")
-            asyncio.run_coroutine_threadsafe(
-                websocket.close(code=1011, reason=str(e)), loop
-            )
-
-    try:
-        # Run Deepgram worker in background thread
-        thread_future = loop.run_in_executor(None, deepgram_worker)
-
-        try:
-            while True:
-                data = await websocket.receive_bytes()
-                audio_q.put(data)
-        except WebSocketDisconnect:
-            logger.info("[/listen] Client disconnected")
-        except Exception as e:
-            logger.error(f"[/listen] Receive error: {e}")
-        finally:
-            stop_event.set()
-            await asyncio.wait_for(asyncio.wrap_future(thread_future), timeout=10.0)
-
-    except Exception as e:
-        logger.error(f"[/listen] Fatal error: {e}")
-        try:
-            await websocket.close(code=1011, reason=str(e))
-        except Exception:
-            pass
 
 if __name__ == "__main__":
     import uvicorn
