@@ -1,4 +1,4 @@
-# Supabase LLM Chatbot API Documentation
+# Cogniv API Documentation
 
 This API provides authentication via Supabase and streaming chat responses from OpenAI and Gemini.
 
@@ -12,13 +12,30 @@ This API provides authentication via Supabase and streaming chat responses from 
 Only `https://cogniv.co.in` is allowed by default. Configurable via `CORS_ORIGINS` env var (comma-separated for multiple origins, e.g. local dev).
 
 ### Rate Limiting
-Applied per IP address. Returns `429 Too Many Requests` with `Retry-After` header on breach.
+Applied per client IP address, taken from Cloudflare's `CF-Connecting-IP` header (Render passes client-sent `X-Forwarded-For` through unfiltered, so it is not trusted). Returns `429 Too Many Requests` on breach.
 
 | Endpoint | Limit |
 |----------|-------|
 | `POST /login` | 10 req/min |
 | `POST /signup` | 5 req/min |
+| `POST /refresh` | 30 req/min |
+| `POST /auth/google/mobile` | 10 req/min |
+| `POST /auth/password-reset/request` | 5 req/min |
+| `POST /auth/password-reset/confirm` | 10 req/min |
 | `POST /payment/create-order` | 10 req/min |
+| `POST /payment/verify` | 10 req/min |
+| `POST /ai-answer` | 60 req/min |
+| `POST /analyse-screen` | 20 req/min |
+| `POST /deepgram/token` | 30 req/min |
+| `POST /launch_signup` | 5 req/min |
+| `POST /track` | 120 req/min |
+
+### Request Size Limits
+| Input | Limit | Over the limit |
+|-------|-------|----------------|
+| Resume upload (`/save_profile`) | 5 MB | `413` |
+| Screen image (`/analyse-screen`) | 8 MB | `413` |
+| Question text (`/ai-answer` `question` / `query` / `text`) | 4000 characters | `422` |
 
 ### Security Headers
 All responses include:
@@ -31,6 +48,8 @@ X-Frame-Options: DENY
 Auth endpoints return opaque error codes — no internal details or user enumeration signals leaked:
 - `/login` always returns `"invalid_credentials"` on 401 (wrong email OR wrong password)
 - `/signup` returns `"email_taken"` (409) or `"signup_failed"` (400)
+- Unexpected server errors return a generic message; details are only logged.
+- `422` validation errors are logged with the path and error locations only — never the request body or the offending values.
 
 ---
 
@@ -104,6 +123,7 @@ Sign in with Google from a native mobile app. The app obtains a Google **`id_tok
 
 *   **URL**: `/auth/google/mobile`
 *   **Method**: `POST`
+*   **Rate limit**: 10 requests/minute per IP
 *   **Request Body**:
     ```json
     {
@@ -125,6 +145,8 @@ Sign in with Google from a native mobile app. The app obtains a Google **`id_tok
 *   **Error Responses**:
     *   **Code**: 401 `{"detail": "invalid_id_token"}` (or a specific reason such as `invalid_audience`, `invalid_issuer`, `email_not_verified`)
     *   **Code**: 422 `{"detail": "id_token is required"}`
+    *   **Code**: 429 Too Many Requests
+*   **Email verification**: the token's `email_verified` claim must be true. Every Google flow (mobile, desktop, web, legacy refresh) refuses an unverified email, because sign-in links to any existing account with that email.
 *   **Configuration**: Set the native OAuth client IDs in the environment so their values are accepted as the token's `aud`:
     *   `GOOGLE_ANDROID_CLIENT_ID` — Android OAuth client ID (registered with the app's SHA-1 fingerprint).
     *   `GOOGLE_IOS_CLIENT_ID` — iOS OAuth client ID (registered with the app's bundle ID).
@@ -135,6 +157,8 @@ Exchange a **refresh token** for new `access_token` / `refresh_token` values. Ne
 
 *   **URL**: `/refresh`
 *   **Method**: `POST`
+*   **Rate limit**: 30 requests/minute per IP
+*   **Rotation**: app refresh tokens are single-use. The old token is revoked and the new one issued atomically, so two concurrent refreshes with the same token succeed only once. **Reuse detection:** presenting a token that was already used (or revoked by logout) revokes *all* of that user's refresh tokens — every device must sign in again. Clients must store the new `refresh_token` from each response and never retry a refresh with the old one.
 *   **Request Body**:
     ```json
     {
@@ -157,8 +181,9 @@ Exchange a **refresh token** for new `access_token` / `refresh_token` values. Ne
         ```
         `provider` is `neon` or `google` so clients can store which flow to use on the next refresh.
 *   **Error Response**:
-    *   **Code**: 401 Unauthorized (invalid or expired refresh token)
+    *   **Code**: 401 Unauthorized (invalid, expired or reused refresh token)
     *   **Code**: 422 Unprocessable Entity (missing `refresh_token` or invalid `provider`)
+    *   **Code**: 429 Too Many Requests
 
 For Neon Auth, the backend calls your Better Auth base URL (see `NEON_AUTH_BASE_URL`). You can optionally set **`NEON_AUTH_REFRESH_URL`** in the environment to the full refresh endpoint if it differs from the defaults (`…/refresh`, `…/refresh-token`).
 
@@ -361,12 +386,13 @@ Save an interview profile (job role, display name, resume file, default flag) fo
     *   `job_role`: **Required**. Text.
     *   `name`: **Required**. Profile label.
     *   `is_default`: Optional. String interpreted as boolean (`true`, `1`, `yes`, `on`). Default `false`. If true, other profiles for this user are cleared from default before insert.
-    *   `resume`: **Required**. File — `.pdf` or `.docx`.
+    *   `resume`: **Required**. File — `.pdf` or `.docx`, at most 5 MB.
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content**: Row from `interview_profiles` (`id`, `user_id`, `name`, `role`, `resume_text`, `is_default`, `sort_order`, `created_at`, `updated_at`).
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
+    *   **Code**: 413 Payload Too Large (resume over 5 MB)
     *   **Code**: 422 Unprocessable Entity (invalid resume type)
     *   **Code**: 500 Internal Server Error
 
@@ -504,14 +530,16 @@ Extract raw text from an uploaded image, then **stream** an LLM answer for any q
 *   **Query Parameters**:
     *   `provider`: Optional. LLM for OCR and answering. `"openai"` (default), `"gemini"`, or `"anthropic"` (Claude).
 *   **Request Body** (form fields):
-    *   `file`: The image file to analyze.
+    *   `file`: The image file to analyze, at most 8 MB.
     *   `session_id`: **Required**. UUID of an `interview_sessions` row owned by the user.
+*   **Rate limit**: 20 requests/minute per IP
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content-Type**: `text/event-stream`
     *   **Body**:
         1. **First line**: a single JSON object (UTF-8) ending with a newline, e.g. `{"extracted_text":"..."}\n`. This is the OCR result; parse it before treating the rest of the body as streamed text.
         2. **Remainder**: streamed answer text (same style as `/chat`—incremental chunks, not a second JSON envelope).
+        3. If the LLM fails mid-stream, the body ends with the line `\n\n[Answer interrupted — please try again.]` (still HTTP 200, since headers are already sent). The partial answer is saved.
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
     *   **Code**: 404 Not Found (session not found or not owned)
@@ -519,8 +547,10 @@ Extract raw text from an uploaded image, then **stream** an LLM answer for any q
         ```json
         { "detail": { "error": "session_ended", "message": "This session has ended. Start a new session to continue." } }
         ```
+    *   **Code**: 413 Payload Too Large (image over 8 MB)
     *   **Code**: 422 Unprocessable Entity (invalid `session_id`)
-    *   **Code**: 500 Internal Server Error
+    *   **Code**: 429 Too Many Requests
+    *   **Code**: 500 Internal Server Error (generic message; details are logged)
 
 ### 18. AI Answer (Streaming)
 Answer a question using OpenAI or Gemini with a **streaming** response (same as `/chat`). Persists `query` (question), `response` (full answer after the stream completes), and `query_type` = `transcript` on `interview_responses` for the given session.
@@ -541,12 +571,13 @@ Answer a question using OpenAI or Gemini with a **streaming** response (same as 
     }
     ```
     *   `session_id`: **Required**.
-    *   Provide exactly one of `question`, `query`, or `text` for the prompt.
-    *   `provider`: Optional. `"openai"` (default) or `"gemini"`.
+    *   Provide exactly one of `question`, `query`, or `text` for the prompt (max 4000 characters).
+    *   `provider`: Optional. `"openai"` (default), `"gemini"`, or `"anthropic"` / `"claude"`.
+*   **Rate limit**: 60 requests/minute per IP
 *   **Success Response**:
     *   **Code**: 200 OK
     *   **Content-Type**: `text/event-stream`
-    *   **Body**: A stream of text chunks (same as `/chat`).
+    *   **Body**: A stream of text chunks (same as `/chat`). If the LLM fails mid-stream, the body ends with `\n\n[Answer interrupted — please try again.]` (still HTTP 200). The partial answer is saved.
 *   **Error Response**:
     *   **Code**: 401 Unauthorized
     *   **Code**: 404 Not Found (session not found or not owned)
@@ -554,14 +585,16 @@ Answer a question using OpenAI or Gemini with a **streaming** response (same as 
         ```json
         { "detail": { "error": "session_ended", "message": "This session has ended. Start a new session to continue." } }
         ```
-    *   **Code**: 422 Unprocessable Entity (invalid `session_id` or missing question field)
-    *   **Code**: 500 Internal Server Error
+    *   **Code**: 422 Unprocessable Entity (invalid `session_id`, missing question field, or question over 4000 characters)
+    *   **Code**: 429 Too Many Requests
+    *   **Code**: 500 Internal Server Error (generic message; details are logged)
 
 ### 19. Deepgram Transcription Token
 Short-lived Deepgram token for streaming transcription straight to Deepgram. The account API key never leaves the server (the old `GET /deepgram/api_key` and `GET /gemini/api_key` endpoints are removed). The token only has to be valid when the WebSocket opens (60 s TTL); the stream keeps running after it expires. Requires an active interview session.
 
 *   **URL**: `/deepgram/token`
 *   **Method**: `POST`
+*   **Rate limit**: 30 requests/minute per IP
 *   **Headers**:
     *   `Authorization: Bearer <access_token>`
     *   `Content-Type: application/json`
@@ -624,8 +657,11 @@ Redirect to Google's consent screen. For use by the Electron desktop app only.
 *   **Method**: `GET`
 *   **Query Parameters**:
     *   `local_port`: **Required**. Loopback port the Electron app is listening on.
+    *   `nonce`: Optional (recommended). A fresh random value per login, 32–128 URL-safe characters (`A-Z a-z 0-9 _ -`). It is signed into the OAuth `state` and echoed back on the loopback redirect; the app should reject any callback whose `nonce` doesn't match the one it sent (login CSRF protection). Omit it only for older app builds.
 *   **Success Response**:
     *   **Code**: 302 Redirect → Google OAuth consent URL
+*   **Error Response**:
+    *   **Code**: 422 Unprocessable Entity (`nonce` malformed)
 
 ---
 
@@ -637,9 +673,10 @@ Receives the OAuth code from Google, exchanges it, and redirects to the Electron
 *   **Query Parameters** (set by Google):
     *   `code`, `state`, `error`
 *   **Success Response**:
-    *   **Code**: 302 Redirect → `http://127.0.0.1:{local_port}/callback?access_token=...&refresh_token=...&user_id=...`
+    *   **Code**: 302 Redirect → `http://127.0.0.1:{local_port}/callback?access_token=...&refresh_token=...&user_id=...&nonce=<nonce>` (`nonce` only when the start request sent one)
 *   **Error Response**:
-    *   **Code**: 302 Redirect → `http://127.0.0.1:{local_port}/callback?error=<message>`
+    *   **Code**: 302 Redirect → `http://127.0.0.1:{local_port}/callback?error=<message>&nonce=<nonce>` (`nonce` present when the `state` was valid and carried one)
+    *   `error` values include `invalid_state`, `token_exchange_failed`, `no_email_from_google`, `email_not_verified`, or Google's own error (e.g. `access_denied`).
 
 ---
 
@@ -665,7 +702,7 @@ Receives the OAuth code from Google, exchanges it, and redirects back to the web
     *   Tokens are in the **URL fragment** (`#`), not query params — fragments are never sent to servers or logged.
     *   Frontend reads via `new URLSearchParams(window.location.hash.slice(1))`
 *   **Error Response**:
-    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback?error=<message>` (errors via query param, not fragment)
+    *   **Code**: 302 Redirect → `https://cogniv.co.in/auth/callback?error=<message>` (errors via query param, not fragment). Includes `email_not_verified` when Google reports the email as unverified.
 
 ---
 
@@ -730,6 +767,7 @@ The checkout signature is verified, then the order and payment are fetched from 
 
 *   **URL**: `/payment/verify`
 *   **Method**: `POST`
+*   **Rate limit**: 10 requests/minute per IP
 *   **Headers**:
     *   `Authorization: Bearer <access_token>`
     *   `Content-Type: application/json`
@@ -752,7 +790,9 @@ The checkout signature is verified, then the order and payment are fetched from 
     *   **Code**: 400 Bad Request (signature mismatch, unknown plan, `plan_id` differs from the order, or the payment is unpaid / wrong amount)
     *   **Code**: 401 Unauthorized
     *   **Code**: 403 Forbidden (the order was created by another account)
+    *   **Code**: 429 Too Many Requests
     *   **Code**: 502 Bad Gateway (Razorpay unreachable — nothing credited; the webhook will credit it)
+    *   A payment Razorpay reports as unpaid / wrong amount returns `{"detail": "Payment not verified"}` — the specific reason is logged, not returned.
 
 ---
 
@@ -873,7 +913,7 @@ Records a marketing-site event — a page visit or a download button click — t
     *   `meta`: Free-form JSON. The download button sends `{ "href": ..., "label": ..., "id": ... }`.
     *   Every other field is optional.
 *   **Captured server-side** (not sent by the client):
-    *   `ip` — first hop of `X-Forwarded-For`, else `X-Real-IP`, else the socket peer.
+    *   `ip` — the client IP from Cloudflare's `CF-Connecting-IP` header. A client-sent `X-Forwarded-For` is not trusted.
     *   `user_agent` — from the request header.
     *   `country` / `region` / `city` — resolved from the IP in a **background task** (never blocks the response), cached per-IP for 24h.
 *   **Success Response**:
@@ -936,6 +976,127 @@ Records a marketing-site event — a page visit or a download button click — t
     *   **Code**: 403 Forbidden — `{ "detail": "admin_required" }` (caller is not an admin)
     *   **Code**: 401 Unauthorized — missing/invalid token
     *   **Code**: 422 Unprocessable Entity — `days` outside 1–365
+
+---
+
+### 34. Health Check
+Liveness probe for Render / uptime monitors. Runs `SELECT 1` against the database with a short timeout (~3 s).
+
+*   **URL**: `/health`
+*   **Method**: `GET`
+*   **Success Response**: **Code**: 200 OK — `{ "ok": true }`
+*   **Error Response**: **Code**: 503 Service Unavailable — `{ "ok": false }` (database unreachable or slow)
+
+---
+
+### 35. Password Reset — Request
+Email the user a password-reset link via Neon Auth (Better Auth `POST /request-password-reset`). The link sends the user to `PASSWORD_RESET_REDIRECT_URL` (default `https://www.cogniv.co.in/reset-password/`) with `?token=<token>` appended (or `?error=INVALID_TOKEN` if the link is invalid/expired). Neon Auth reset links expire after 15 minutes.
+
+*   **URL**: `/auth/password-reset/request`
+*   **Method**: `POST`
+*   **Rate limit**: 5 requests/minute per IP
+*   **Request Body**:
+    ```json
+    { "email": "user@example.com" }
+    ```
+*   **Success Response**: **Code**: 200 OK — `{ "ok": true }`
+    *   Always 200, whether or not an account exists for the email (no account enumeration). Upstream failures are logged, not returned.
+*   **Error Response**:
+    *   **Code**: 422 Unprocessable Entity (missing `email`)
+    *   **Code**: 429 Too Many Requests
+*   **Configuration**: the redirect URL's origin must be a trusted origin / allowed domain in the Neon Auth project settings, and email/password sign-in must be enabled.
+
+---
+
+### 36. Password Reset — Confirm
+Set a new password using the token from the reset link (Better Auth `POST /reset-password`). On success, all of the user's app refresh tokens are revoked, so every device must sign in again.
+
+*   **URL**: `/auth/password-reset/confirm`
+*   **Method**: `POST`
+*   **Rate limit**: 10 requests/minute per IP
+*   **Request Body**:
+    ```json
+    { "token": "token-from-reset-link", "new_password": "at-least-8-chars" }
+    ```
+    *   `new_password`: 8–128 characters.
+*   **Success Response**: **Code**: 200 OK — `{ "ok": true }`
+*   **Error Response**:
+    *   **Code**: 400 Bad Request — `{ "detail": "invalid_or_expired_token" }`
+    *   **Code**: 422 Unprocessable Entity (`new_password` shorter than 8 or longer than 128 characters, or missing fields)
+    *   **Code**: 429 Too Many Requests
+    *   **Code**: 502 Bad Gateway — `{ "detail": "password_reset_unavailable" }` (Neon Auth unreachable)
+
+---
+
+### 37. Export My Data
+Download everything stored about the authenticated user as a JSON file (DPDP / GDPR access request).
+
+*   **URL**: `/user/me/export`
+*   **Method**: `GET`
+*   **Headers**: `Authorization: Bearer <access_token>`
+*   **Success Response**:
+    *   **Code**: 200 OK, `Content-Disposition: attachment; filename="cogniv-data.json"`
+    *   **Content**:
+        ```json
+        {
+          "account": { "id": "uuid", "email": "user@example.com", "name": "Jane", "created_at": "2026-01-01T00:00:00+00:00" },
+          "interview_profiles": [ { "id": "uuid", "name": "...", "role": "...", "resume_text": "..." } ],
+          "interview_sessions": [ { "id": "uuid", "job_title": "...", "started_at": "...", "ended_at": "..." } ],
+          "interview_responses": [ { "session_id": "uuid", "query": "...", "response": "...", "query_type": "transcript", "created_at": "..." } ],
+          "purchases": [ { "plan_id": "starter", "sessions": 7, "amount": 79900, "order_id": "order_...", "payment_id": "pay_...", "created_at": "..." } ],
+          "subscription": { "plan_tier": "starter", "sessions_purchased": 7 },
+          "free_usage": { "sessions_used": 3 },
+          "site_events": [ { "event": "app_launch", "source": "app", "created_at": "..." } ],
+          "chat_threads": [ { "id": "uuid", "title": "...", "created_at": "..." } ],
+          "chat_history": [ { "thread_id": "uuid", "query": "...", "response": "...", "created_at": "..." } ],
+          "usage_daily": [ { "day": "2026-10-01", "ai_answer_count": 4, "screen_analysis_count": 1 } ]
+        }
+        ```
+        Row objects contain every column of their table (abbreviated above). `site_events` lists analytics events linked to the account; events recorded before sign-in are anonymous and not linked.
+*   **Error Response**:
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 404 Not Found (user row missing)
+
+---
+
+### 38. Delete My Account
+Permanently delete the authenticated user's data, in one transaction. **Irreversible.**
+
+*   **URL**: `/user/me`
+*   **Method**: `DELETE`
+*   **Headers**: `Authorization: Bearer <access_token>`, `Content-Type: application/json`
+*   **Request Body**:
+    ```json
+    { "confirm": "DELETE" }
+    ```
+*   **What happens**:
+    *   **Deleted**: interview responses, interview sessions, interview profiles (incl. resume text), legacy chat threads and history, daily usage counters, subscription, free-usage counter, all refresh tokens, Neon Auth sessions, Neon Auth login methods (password hash, Google link) and pending reset/verification tokens.
+    *   **Anonymized**: analytics events lose their `user_id` and `ip`; the `neon_auth.user` row is kept as a tombstone with its email replaced by `deleted-<id>@deleted.cogniv.invalid`, name `Deleted user`, no image.
+    *   **Retained**: purchase records (`purchases`: plan, amount, Razorpay order/payment IDs, date) — payment records are retained as legally required for tax/accounting. They stay linked to the anonymized tombstone (deleting the user row would cascade-delete them).
+    *   The user can no longer sign in. Signing up again with the same email creates a new, empty account. Already-issued access tokens stay valid until they expire (≤1h) but no data remains behind them.
+*   **Success Response**: **Code**: 200 OK — `{ "ok": true }`
+*   **Error Response**:
+    *   **Code**: 400 Bad Request (`confirm` is not exactly `"DELETE"`)
+    *   **Code**: 401 Unauthorized
+    *   **Code**: 500 Internal Server Error (nothing was deleted — the transaction rolled back)
+
+---
+
+### 39. Launch Signup
+Record a pre-launch signup from the marketing site. Public.
+
+*   **URL**: `/launch_signup`
+*   **Method**: `POST`
+*   **Rate limit**: 5 requests/minute per IP
+*   **Request Body**:
+    ```json
+    { "email": "user@example.com", "phone": "+91...", "name": "Jane", "profession": "Engineer" }
+    ```
+*   **Success Response**: **Code**: 200 OK — `{ "message": "Launch signup recorded", "id": "uuid" }` (the submitted details are not echoed back)
+*   **Error Response**:
+    *   **Code**: 422 Unprocessable Entity (missing fields)
+    *   **Code**: 429 Too Many Requests
+    *   **Code**: 500 Internal Server Error (generic message)
 
 ---
 

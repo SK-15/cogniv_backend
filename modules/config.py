@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""
     # Secret set on the Razorpay dashboard webhook (Settings → Webhooks).
     razorpay_webhook_secret: str = ""
+    # Where the Neon Auth reset email sends the user (?token=... is appended).
+    # Its origin must be a trusted origin in the Neon Auth settings.
+    password_reset_redirect_url: str = "https://www.cogniv.co.in/reset-password/"
+    # Error reporting; Sentry stays off unless SENTRY_DSN is set.
+    sentry_dsn: str = ""
+    sentry_traces_sample_rate: float = 0.0
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 

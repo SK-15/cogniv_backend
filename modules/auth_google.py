@@ -2,7 +2,7 @@ import asyncio
 import urllib.parse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from google.auth.transport import requests as google_requests
@@ -12,7 +12,8 @@ from pydantic import BaseModel
 from modules.config import settings
 from modules.database import fetch_one, execute
 from modules.billing import provision_free_subscription
-from modules.app_tokens import mint_access_token, issue_refresh_token
+from modules.app_tokens import mint_access_token, issue_refresh_token, require_app_secret_key
+from modules.rate_limit import limiter
 
 router = APIRouter()
 
@@ -20,7 +21,16 @@ GOOGLE_AUTH_URL     = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL    = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
-_signer = URLSafeTimedSerializer(settings.app_secret_key or "fallback-key")
+_signer = URLSafeTimedSerializer(require_app_secret_key())
+
+# Optional per-login value from the desktop app, echoed back on the loopback
+# redirect so the app can reject a callback it did not start (login CSRF).
+DESKTOP_NONCE_PATTERN = r"^[A-Za-z0-9_-]{32,128}$"
+
+
+def _email_verified(value) -> bool:
+    """Google sends email_verified as a bool (userinfo) or "true" (older id_tokens)."""
+    return value is True or str(value).lower() == "true"
 
 
 async def refresh_google_oauth_tokens(refresh_token: str) -> dict | None:
@@ -63,7 +73,7 @@ async def refresh_google_oauth_tokens(refresh_token: str) -> dict | None:
     email = profile.get("email")
     name = profile.get("name", "")
     image = profile.get("picture", "")
-    if not email:
+    if not email or not _email_verified(profile.get("email_verified")):
         return None
 
     user = await _find_or_create_user(email=email, name=name, image=image)
@@ -76,6 +86,8 @@ async def refresh_google_oauth_tokens(refresh_token: str) -> dict | None:
 
 
 async def _find_or_create_user(email: str, name: str, image: str = "") -> dict:
+    # Callers must only pass an email Google reports as verified: the lookup
+    # links to any existing account with that email.
     row = await fetch_one(
         'SELECT id, email FROM neon_auth."user" WHERE email = $1',
         email,
@@ -179,6 +191,8 @@ async def google_callback_web(
     image = profile.get("picture", "")
     if not email:
         return _error_redirect("no_email_from_google")
+    if not _email_verified(profile.get("email_verified")):
+        return _error_redirect("email_not_verified")
 
     user = await _find_or_create_user(email=email, name=name, image=image)
     access_token  = mint_access_token(user["id"], user["email"])
@@ -193,12 +207,23 @@ async def google_callback_web(
 
 
 @router.get("/auth/google/start")
-def google_start(local_port: int = Query(..., description="Loopback port the Electron app is listening on")):
+def google_start(
+    local_port: int = Query(..., description="Loopback port the Electron app is listening on"),
+    nonce: str | None = Query(
+        None,
+        pattern=DESKTOP_NONCE_PATTERN,
+        description="Optional random value (32-128 URL-safe chars) echoed back on the loopback redirect.",
+    ),
+):
     """
     Redirect the browser to Google's OAuth consent screen.
-    local_port is signed into the state so the callback knows where to redirect.
+    local_port (and the app's nonce, if sent) is signed into the state so the
+    callback knows where to redirect.
     """
-    state = _signer.dumps({"nonce": "cogniv-oauth", "port": local_port})
+    payload = {"nonce": "cogniv-oauth", "port": local_port}
+    if nonce:
+        payload["app_nonce"] = nonce
+    state = _signer.dumps(payload)
     params = {
         "client_id":     settings.google_client_id,
         "redirect_uri":  settings.google_redirect_uri,
@@ -224,10 +249,16 @@ async def google_callback(
     (the loopback server the Electron app started before opening the browser).
     """
 
-    def _error_redirect(port: int | None, msg: str) -> RedirectResponse:
-        params = urllib.parse.urlencode({"error": msg})
+    app_nonce: str | None = None
+
+    def _loopback_redirect(port: int | None, params: dict) -> RedirectResponse:
+        if app_nonce:
+            params = {**params, "nonce": app_nonce}
         base = f"http://127.0.0.1:{port}/callback" if port else "http://127.0.0.1/callback"
-        return RedirectResponse(f"{base}?{params}", status_code=302)
+        return RedirectResponse(f"{base}?{urllib.parse.urlencode(params)}", status_code=302)
+
+    def _error_redirect(port: int | None, msg: str) -> RedirectResponse:
+        return _loopback_redirect(port, {"error": msg})
 
     # 1. Verify CSRF state and extract local_port before anything else
     local_port: int | None = None
@@ -235,7 +266,8 @@ async def google_callback(
         try:
             payload = _signer.loads(state, max_age=600)
             local_port = int(payload["port"])
-        except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError):
+            app_nonce = payload.get("app_nonce")
+        except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError, AttributeError):
             return _error_redirect(None, "invalid_state")
 
     # 2. Handle user-denied or missing params (port now known for error redirect)
@@ -279,6 +311,8 @@ async def google_callback(
 
     if not email:
         return _error_redirect(local_port, "no_email_from_google")
+    if not _email_verified(profile.get("email_verified")):
+        return _error_redirect(local_port, "email_not_verified")
 
     # 5. Find or create the user in the database
     user = await _find_or_create_user(email=email, name=name, image=image)
@@ -288,12 +322,11 @@ async def google_callback(
     refresh_token = await issue_refresh_token(user["id"])
 
     # 7. Redirect to the Electron loopback server
-    params = urllib.parse.urlencode({
+    return _loopback_redirect(local_port, {
         "access_token":  access_token,
         "refresh_token": refresh_token,
         "user_id":       user["id"],
     })
-    return RedirectResponse(f"http://127.0.0.1:{local_port}/callback?{params}", status_code=302)
 
 
 def _accepted_mobile_audiences() -> list[str]:
@@ -330,7 +363,7 @@ def _verify_google_id_token(token: str) -> dict:
         raise ValueError("invalid_audience")
     if not claims.get("email"):
         raise ValueError("no_email")
-    if claims.get("email_verified") is False:
+    if not _email_verified(claims.get("email_verified")):
         raise ValueError("email_not_verified")
     return claims
 
@@ -340,7 +373,8 @@ class GoogleMobileRequest(BaseModel):
 
 
 @router.post("/auth/google/mobile")
-async def google_mobile(body: GoogleMobileRequest):
+@limiter.limit("10/minute")
+async def google_mobile(request: Request, body: GoogleMobileRequest):
     """
     Native mobile Google Sign-In.
 

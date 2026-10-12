@@ -132,6 +132,7 @@ class ConfirmPaidOrderTest(unittest.TestCase):
 class _ApiTest(unittest.TestCase):
     def setUp(self):
         main.app.dependency_overrides[main.require_user_id] = lambda: USER
+        main.limiter.reset()  # rate-limit counters are per process; isolate tests
         self.client = TestClient(main.app)
         self.patches = []
 

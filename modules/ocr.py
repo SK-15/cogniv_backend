@@ -4,19 +4,18 @@ import logging
 import re
 from typing import Optional
 
-import openai
-from google import genai
 from google.genai import types
-import anthropic
-from modules.config import settings
+from modules.llm import (
+    ANTHROPIC_BETAS,
+    ANTHROPIC_FALLBACKS,
+    ANTHROPIC_MODEL,
+    GEMINI_MODEL,
+    _anthropic_client,
+    _gemini_client,
+    _openai_client,
+)
 
 logger = logging.getLogger(__name__)
-
-_gemini_client = genai.Client(api_key=settings.gemini_api_key)
-_anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-_openai_client = openai.AsyncOpenAI(api_key=settings.openai_api_key)
-
-ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"
 
 
 async def extract_structured_text(
@@ -94,7 +93,7 @@ async def _extract_gemini_text(image_bytes: bytes, mime_type: str, prompt: str) 
         ])
     ]
     response = await _gemini_client.aio.models.generate_content(
-        model="gemini-1.5-flash",
+        model=GEMINI_MODEL,
         contents=contents,
     )
     return response.text or None
@@ -117,9 +116,11 @@ async def _extract_openai_text(image_bytes: bytes, mime_type: str, prompt: str) 
 
 async def _extract_anthropic_text(image_bytes: bytes, mime_type: str, prompt: str) -> Optional[str]:
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
-    response = await _anthropic_client.messages.create(
+    response = await _anthropic_client.beta.messages.create(
         model=ANTHROPIC_MODEL,
-        max_tokens=4096,
+        max_tokens=16000,
+        betas=ANTHROPIC_BETAS,
+        extra_body=ANTHROPIC_FALLBACKS,
         messages=[
             {
                 "role": "user",
@@ -137,6 +138,8 @@ async def _extract_anthropic_text(image_bytes: bytes, mime_type: str, prompt: st
             }
         ],
     )
+    if response.stop_reason == "refusal":
+        return None
     text = "".join(block.text for block in response.content if block.type == "text")
     return text or None
 
@@ -149,7 +152,7 @@ async def _extract_gemini(image_bytes: bytes, mime_type: str, prompt: str) -> Op
         ])
     ]
     response = await _gemini_client.aio.models.generate_content(
-        model="gemini-1.5-flash",
+        model=GEMINI_MODEL,
         contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
@@ -190,9 +193,11 @@ async def _extract_openai(image_bytes: bytes, mime_type: str, prompt: str) -> Op
 
 async def _extract_anthropic(image_bytes: bytes, mime_type: str, prompt: str) -> Optional[dict]:
     base64_image = base64.b64encode(image_bytes).decode("utf-8")
-    response = await _anthropic_client.messages.create(
+    response = await _anthropic_client.beta.messages.create(
         model=ANTHROPIC_MODEL,
-        max_tokens=4096,
+        max_tokens=16000,
+        betas=ANTHROPIC_BETAS,
+        extra_body=ANTHROPIC_FALLBACKS,
         messages=[
             {
                 "role": "user",
@@ -210,6 +215,8 @@ async def _extract_anthropic(image_bytes: bytes, mime_type: str, prompt: str) ->
             }
         ],
     )
+    if response.stop_reason == "refusal":
+        return None
     content = "".join(block.text for block in response.content if block.type == "text")
     if not content:
         return None

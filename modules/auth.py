@@ -313,3 +313,53 @@ async def get_user_role(user_id: str) -> str | None:
         return row["role"] if row else None
     except Exception:
         return None
+
+
+class PasswordResetError(Exception):
+    """Neon Auth rejected the reset (bad/expired token) — the client must start over."""
+
+
+async def request_password_reset(email: str) -> None:
+    """
+    Ask Neon Auth (Better Auth) to email a reset link. Better Auth answers the
+    same way for unknown emails, so this never reveals whether an account exists.
+    Raises on transport/5xx errors; the caller logs and still answers 200.
+    """
+    url = f"{settings.neon_auth_base_url}/request-password-reset"
+    body = {"email": email, "redirectTo": settings.password_reset_redirect_url}
+    await _post_json(url, body, origin_header=_auth_origin())
+
+
+async def get_password_reset_user_id(token: str) -> str | None:
+    """
+    The user a reset token belongs to, read from Better Auth's verification
+    table (identifier `reset-password:<token>`, value = user id). Must be read
+    before the reset: Better Auth deletes the row when the token is used.
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT value FROM neon_auth.verification WHERE identifier = $1',
+                f"reset-password:{token}",
+            )
+        return row["value"] if row else None
+    except Exception:
+        return None
+
+
+async def confirm_password_reset(token: str, new_password: str) -> None:
+    """
+    Set a new password with the emailed token. Raises PasswordResetError when
+    Neon Auth rejects the token (4xx); other exceptions mean Neon Auth is unreachable.
+    """
+    url = f"{settings.neon_auth_base_url}/reset-password"
+    body = {"token": token, "newPassword": new_password}
+
+    def _do_post():
+        resp = requests.post(url, json=body, headers={"Origin": _auth_origin()}, timeout=20)
+        if 400 <= resp.status_code < 500:
+            raise PasswordResetError(f"Neon Auth returned {resp.status_code}")
+        resp.raise_for_status()
+
+    await asyncio.to_thread(_do_post)

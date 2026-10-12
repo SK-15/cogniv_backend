@@ -1,12 +1,13 @@
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, UploadFile, File, Form, Request, BackgroundTasks
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from typing import Optional
 from modules.config import settings
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from modules.rate_limit import client_ip, limiter
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 import asyncio
@@ -19,10 +20,28 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
-from modules.auth import sign_up_user, login_user, get_user, get_auth_user_row, get_user_role
+from modules.auth import (
+    PasswordResetError,
+    confirm_password_reset,
+    get_auth_user_row,
+    get_password_reset_user_id,
+    get_user,
+    get_user_role,
+    login_user,
+    request_password_reset,
+    sign_up_user,
+)
 from modules.auth_google import router as google_router, refresh_google_oauth_tokens
-from modules.app_tokens import mint_access_token, issue_refresh_token, rotate_refresh_token, revoke_refresh_token
-from modules.llm import stream_openai, stream_gemini, select_stream, _openai_client
+from modules.app_tokens import (
+    issue_refresh_token,
+    mint_access_token,
+    require_app_secret_key,
+    revoke_all_refresh_tokens,
+    revoke_refresh_token,
+    rotate_refresh_token,
+)
+from modules.account import delete_user_data, export_user_data
+from modules.llm import select_stream
 from modules.ocr import extract_text
 from modules.resume_text import extract_resume_text, ResumeTextExtractionError
 from modules.interview import (
@@ -43,7 +62,7 @@ from modules.analytics import (
     update_event_geo,
 )
 from modules.admin_stats import get_admin_stats
-from modules.database import fetch_one, get_pool
+from modules.database import get_pool
 from modules.billing import (
     FREE_SESSION_LIMIT,
     PLAN_CONFIG,
@@ -72,9 +91,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-limiter = Limiter(key_func=get_remote_address)
+# Fail fast: every access token and OAuth state is signed with this key.
+require_app_secret_key()
 
-app = FastAPI(title="Supabase LLM Chatbot API")
+if settings.sentry_dsn:
+    import sentry_sdk
+
+    # The FastAPI/Starlette integrations load automatically. With
+    # send_default_pii off, Authorization/Cookie headers and client IPs are not sent.
+    sentry_sdk.init(
+        dsn=settings.sentry_dsn,
+        send_default_pii=False,
+        traces_sample_rate=settings.sentry_traces_sample_rate,
+    )
+
+app = FastAPI(title="Cogniv API")
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -82,17 +113,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    try:
-        body = await request.body()
-        body_text = body.decode("utf-8", errors="replace")
-    except Exception:
-        body_text = "<unreadable>"
-    logger.error(
-        "[422] Validation error on %s %s | body: %s | errors: %s",
+    # Never log request bodies or the offending values — they can be passwords or tokens.
+    logged_errors = [{k: v for k, v in e.items() if k not in ("input", "ctx")} for e in exc.errors()]
+    logger.warning(
+        "[422] Validation error on %s %s | errors: %s",
         request.method,
         request.url.path,
-        body_text,
-        exc.errors(),
+        logged_errors,
     )
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
@@ -116,16 +143,8 @@ app.include_router(google_router)
 
 
 @app.on_event("startup")
-async def warm_llm():
-    """Pre-establish OpenAI + DB connection pools to eliminate first-request latency."""
-    try:
-        await _openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1,
-        )
-    except Exception:
-        pass
+async def warm_db_pool():
+    """Pre-establish the DB connection pool to eliminate first-request latency."""
     try:
         # Open the asyncpg pool now so the first real request doesn't pay for it.
         pool = await get_pool()
@@ -136,6 +155,61 @@ async def warm_llm():
 
 
 ALLOWED_RESUME_SUFFIXES = {".pdf", ".docx"}
+
+MAX_RESUME_BYTES = 5 * 1024 * 1024
+MAX_SCREEN_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_QUESTION_CHARS = 4000
+
+STREAM_INTERRUPTED_MARKER = "\n\n[Answer interrupted — please try again.]"
+
+
+async def _db_ping() -> None:
+    """Cheap liveness query with a short timeout; raises if the DB is unreachable."""
+    async def _ping():
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1", timeout=2)
+    await asyncio.wait_for(_ping(), timeout=3)
+
+
+@app.get("/health")
+async def health():
+    """Liveness + DB reachability for the load balancer / uptime checks."""
+    try:
+        await _db_ping()
+    except Exception as e:
+        logger.error("[/health] DB check failed: %s", e)
+        return JSONResponse(status_code=503, content={"ok": False})
+    return {"ok": True}
+
+
+async def _read_upload_limited(upload: UploadFile, max_bytes: int, label: str) -> bytes:
+    """Read at most max_bytes (+1 to detect overflow) of an upload; 413 if larger."""
+    data = await upload.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} is too large (max {max_bytes // (1024 * 1024)} MB).",
+        )
+    return data
+
+
+# Strong references to fire-and-forget DB writes so they aren't garbage
+# collected mid-flight; failures are logged instead of vanishing.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _on_background_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Background task failed", exc_info=task.exception())
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_on_background_done)
+    return task
 
 
 async def require_user_id(authorization: str = Header(None)) -> str:
@@ -262,9 +336,9 @@ class VerifyPaymentRequest(BaseModel):
 
 class AIAnswerRequest(BaseModel):
     session_id: str
-    question: Optional[str] = None
-    query: Optional[str] = None
-    text: Optional[str] = None
+    question: Optional[str] = Field(None, max_length=MAX_QUESTION_CHARS)
+    query: Optional[str] = Field(None, max_length=MAX_QUESTION_CHARS)
+    text: Optional[str] = Field(None, max_length=MAX_QUESTION_CHARS)
     provider: str = "openai"  # "openai" or "gemini"
 
     def get_question(self) -> str:
@@ -313,12 +387,27 @@ async def login(request: Request, body: AuthRequest):
         raise HTTPException(status_code=401, detail="invalid_credentials")
 
 
+class PasswordResetRequestBody(BaseModel):
+    email: str = Field(..., max_length=320)
+
+
+class PasswordResetConfirmBody(BaseModel):
+    token: str = Field(..., min_length=1, max_length=512)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+class DeleteAccountRequest(BaseModel):
+    confirm: str = Field(..., description='Must be exactly "DELETE".')
+
+
 @app.post("/refresh")
-async def refresh_session(body: RefreshTokenRequest):
+@limiter.limit("30/minute")
+async def refresh_session(request: Request, body: RefreshTokenRequest):
     """
     Exchange a refresh token for a new access/refresh token pair.
 
-    Primary path: app-issued opaque refresh tokens (rotated on every use).
+    Primary path: app-issued opaque refresh tokens (rotated on every use;
+    replaying an already-used token revokes all of the user's refresh tokens).
     Legacy fallback: Google OAuth refresh tokens issued before the unified
     token system; on success the client is migrated to an app refresh token.
     """
@@ -367,12 +456,51 @@ async def logout(body: RefreshTokenRequest):
     return {"message": "logged_out"}
 
 
+@app.post("/auth/password-reset/request")
+@limiter.limit("5/minute")
+async def password_reset_request(request: Request, body: PasswordResetRequestBody):
+    """
+    Email a password-reset link via Neon Auth. Always 200 — the response never
+    reveals whether an account exists for the email.
+    """
+    email = body.email.strip().lower()
+    if email:
+        try:
+            await request_password_reset(email)
+        except Exception as e:
+            logger.error("[/auth/password-reset/request] Neon Auth request failed: %s", e)
+    return {"ok": True}
+
+
+@app.post("/auth/password-reset/confirm")
+@limiter.limit("10/minute")
+async def password_reset_confirm(request: Request, body: PasswordResetConfirmBody):
+    """Set a new password with the token from the reset email; signs out all app sessions."""
+    # Read before the reset — Neon Auth deletes the token row once it is used.
+    user_id = await get_password_reset_user_id(body.token)
+    try:
+        await confirm_password_reset(body.token, body.new_password)
+    except PasswordResetError as e:
+        logger.info("[/auth/password-reset/confirm] Rejected: %s", e)
+        raise HTTPException(status_code=400, detail="invalid_or_expired_token")
+    except Exception as e:
+        logger.error("[/auth/password-reset/confirm] Neon Auth call failed: %s", e)
+        raise HTTPException(status_code=502, detail="password_reset_unavailable")
+    if user_id:
+        await revoke_all_refresh_tokens(user_id)
+    else:
+        logger.warning("[/auth/password-reset/confirm] Could not resolve user; refresh tokens not revoked")
+    return {"ok": True}
+
+
 DEEPGRAM_GRANT_URL = "https://api.deepgram.com/v1/auth/grant"
 DEEPGRAM_TOKEN_TTL_SECONDS = 60
 
 
 @app.post("/deepgram/token")
+@limiter.limit("30/minute")
 async def deepgram_token(
+    request: Request,
     body: DeepgramTokenRequest,
     user_id: str = Depends(require_user_id),
 ):
@@ -407,39 +535,25 @@ async def deepgram_token(
 
 
 @app.post("/launch_signup")
-async def launch_signup(request: LaunchSignupRequest):
+@limiter.limit("5/minute")
+async def launch_signup(request: Request, body: LaunchSignupRequest):
     try:
         row = await insert_launch_signup(
-            request.email,
-            request.phone,
-            request.name,
-            request.profession,
+            body.email,
+            body.phone,
+            body.name,
+            body.profession,
         )
-    except Exception as e:
+    except Exception:
         logger.exception("launch_signup insert failed")
-        raise HTTPException(status_code=500, detail=str(e))
-    return {
-        "message": "Launch signup recorded",
-        "id": str(row["id"]),
-        "email": row["email"],
-        "phone": row["phone"],
-        "name": row["name"],
-        "profession": row["profession"],
-        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
-    }
+        raise HTTPException(status_code=500, detail="Could not record signup. Try again.")
+    # Don't echo the submitted personal data back.
+    return {"message": "Launch signup recorded", "id": str(row["id"])}
 
 
 def _client_ip(request: Request) -> str | None:
-    """First hop of X-Forwarded-For (set by the proxy), else the socket peer."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else None
+    ip = client_ip(request)
+    return None if ip == "unknown" else ip
 
 
 async def _optional_user_id(authorization: str | None) -> str | None:
@@ -536,7 +650,7 @@ async def save_profile(
             detail="Resume must be a PDF or DOCX file (.pdf, .docx)",
         )
 
-    resume_bytes = await resume.read()
+    resume_bytes = await _read_upload_limited(resume, MAX_RESUME_BYTES, "Resume")
     if not resume_bytes:
         raise HTTPException(status_code=422, detail="Resume file is empty.")
 
@@ -572,6 +686,38 @@ async def get_current_user_profile(user_id: str = Depends(require_user_id)):
         "email": row.get("email"),
         "name": row.get("name"),
     }
+
+
+@app.get("/user/me/export")
+async def export_current_user_data(user_id: str = Depends(require_user_id)):
+    """Download everything stored about the caller as a JSON file (data-subject access)."""
+    data = await export_user_data(user_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="User not found")
+    return JSONResponse(
+        content=jsonable_encoder(data),
+        headers={"Content-Disposition": 'attachment; filename="cogniv-data.json"'},
+    )
+
+
+@app.delete("/user/me")
+async def delete_current_user(
+    body: DeleteAccountRequest,
+    user_id: str = Depends(require_user_id),
+):
+    """
+    Permanently delete the caller's data and anonymize the account.
+    Purchase records are retained (tax/accounting) — see modules/account.py.
+    """
+    if body.confirm != "DELETE":
+        raise HTTPException(status_code=400, detail='Send {"confirm": "DELETE"} to delete the account.')
+    try:
+        await delete_user_data(user_id)
+    except Exception:
+        logger.exception("[DELETE /user/me] Account deletion failed for %s", user_id)
+        raise HTTPException(status_code=500, detail="Could not delete the account. Try again.")
+    logger.info("[DELETE /user/me] Deleted account data for %s", user_id)
+    return {"ok": True}
 
 
 @app.get("/interview/profiles")
@@ -752,7 +898,9 @@ async def payment_create_order(body: CreateOrderRequest, request: Request, user_
 
 
 @app.post("/payment/verify")
+@limiter.limit("10/minute")
 async def payment_verify(
+    request: Request,
     body: VerifyPaymentRequest,
     user_id: str = Depends(require_user_id),
 ):
@@ -775,7 +923,7 @@ async def payment_verify(
         )
     except PaymentError as e:
         logger.warning("[/payment/verify] Rejected order %s: %s", body.razorpay_order_id, e)
-        raise HTTPException(status_code=400, detail=f"Payment not verified: {e}")
+        raise HTTPException(status_code=400, detail="Payment not verified")
     except Exception as e:
         logger.error("[/payment/verify] Razorpay check failed for order %s: %s", body.razorpay_order_id, e)
         raise HTTPException(
@@ -843,7 +991,9 @@ async def payment_webhook(request: Request):
 
 
 @app.post("/analyse-screen")
+@limiter.limit("20/minute")
 async def analyse_screen(
+    request: Request,
     file: UploadFile = File(...),
     session_id: str = Form(...),
     provider: str = Query("openai"),
@@ -858,7 +1008,7 @@ async def analyse_screen(
 
     # Read the upload and check the session concurrently — they're independent.
     image_bytes, _ctx = await asyncio.gather(
-        file.read(),
+        _read_upload_limited(file, MAX_SCREEN_IMAGE_BYTES, "Image"),
         require_active_session(user_id, session_uuid),
     )
 
@@ -891,10 +1041,11 @@ async def analyse_screen(
                     full_response += chunk
                     yield chunk
             except Exception as e:
-                logger.error(f"[/analyse_screen] Stream error: {e}")
+                logger.error(f"[/analyse_screen] Stream error: {e}", exc_info=True)
+                yield STREAM_INTERRUPTED_MARKER
             finally:
                 if full_response:
-                    asyncio.create_task(
+                    _spawn(
                         insert_interview_response(
                             user_id,
                             session_uuid,
@@ -910,18 +1061,20 @@ async def analyse_screen(
         raise
     except Exception as e:
         logger.error(f"Analyse Screen endpoint error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Could not analyse the screen. Try again.")
 
 
 @app.post("/ai-answer")
+@limiter.limit("60/minute")
 async def ai_answer(
-    request: AIAnswerRequest,
+    request: Request,
+    body: AIAnswerRequest,
     user_id: str = Depends(require_user_id),
 ):
     try:
-        session_uuid = _parse_session_id(request.session_id)
+        session_uuid = _parse_session_id(body.session_id)
 
-        question = request.get_question()
+        question = body.get_question()
         # Checks ownership too — the lookup filters by user_id.
         ctx = await require_active_session(user_id, session_uuid)
 
@@ -957,16 +1110,17 @@ async def ai_answer(
 
         async def generate_and_save():
             full_response = ""
-            generator_func = select_stream(request.provider)(question, system_prompt=system_prompt)
+            generator_func = select_stream(body.provider)(question, system_prompt=system_prompt)
             try:
                 async for chunk in generator_func:
                     full_response += chunk
                     yield chunk
             except Exception as e:
-                logger.error(f"[/ai-answer] Stream error: {e}")
+                logger.error(f"[/ai-answer] Stream error: {e}", exc_info=True)
+                yield STREAM_INTERRUPTED_MARKER
             finally:
                 if full_response:
-                    asyncio.create_task(
+                    _spawn(
                         insert_interview_response(
                             user_id,
                             session_uuid,
@@ -981,7 +1135,7 @@ async def ai_answer(
         raise
     except Exception as e:
         logger.error(f"AI Answer endpoint error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Could not generate an answer. Try again.")
 
 if __name__ == "__main__":
     import uvicorn
